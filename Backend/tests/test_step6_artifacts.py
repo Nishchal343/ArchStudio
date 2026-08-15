@@ -1,0 +1,57 @@
+import io
+import asyncio
+from uuid import uuid4
+
+import pytest
+
+from app.schemas import DiagramPayload, EditableDocument, ReportSection
+from app.services.artifacts.diagrams import database_diagram, render_diagram
+from app.services.artifacts.export import export_document
+from app.services.chat.service import answer_project_question
+
+
+def document():
+    return EditableDocument(title="Test report", document_type="report",
+                            sections=[ReportSection(heading="Overview", content="Actual repository evidence.")])
+
+
+def test_document_exports_are_real_files():
+    pdf, pdf_type, _ = export_document(document(), "pdf")
+    docx, docx_type, _ = export_document(document(), "docx")
+    assert pdf.startswith(b"%PDF")
+    assert pdf_type == "application/pdf"
+    assert docx[:2] == b"PK"
+    assert "wordprocessingml" in docx_type
+
+
+def test_database_diagram_reports_absence_without_schema():
+    payload = database_diagram(uuid4())
+    assert "No database schema detected" in payload.notes[0]
+    assert "No database schema detected" in payload.mermaid
+
+
+def test_diagram_renders_locally():
+    payload = DiagramPayload(title="Architecture", diagram_type="architecture_diagram", mermaid="flowchart TD",
+                             nodes=[{"id": "a", "label": "app"}], edges=[])
+    svg, svg_type, _ = render_diagram(payload, "svg")
+    png, png_type, _ = render_diagram(payload, "png")
+    pdf, pdf_type, _ = render_diagram(payload, "pdf")
+    assert svg.startswith(b"<svg") and svg_type == "image/svg+xml"
+    assert png.startswith(b"\x89PNG") and png_type == "image/png"
+    assert pdf.startswith(b"%PDF") and pdf_type == "application/pdf"
+
+
+class FakeProvider:
+    async def generate(self, prompt):
+        assert "FILE: app/auth.py:10-20" in prompt
+        return '{"answer":"Authentication is implemented in the cited file.","evidence":[{"file_path":"app/auth.py"}]}'
+
+
+def test_chat_is_grounded_and_returns_file_evidence(monkeypatch):
+    async def fake_search(*args, **kwargs):
+        return [{"file_path": "app/auth.py", "start_line": 10, "end_line": 20,
+                 "similarity": 0.8, "content": "def authenticate(): pass"}]
+    monkeypatch.setattr("app.services.chat.service.search_project", fake_search)
+    result = asyncio.run(answer_project_question(None, uuid4(), "Where is auth?", 5, FakeProvider()))
+    assert result.answer.startswith("Authentication")
+    assert result.evidence[0].file_path == "app/auth.py"
