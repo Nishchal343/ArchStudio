@@ -165,13 +165,23 @@ class ReportSection(BaseModel):
 class EditableDocument(BaseModel):
     title: str
     document_type: ArtifactKind
+    authors: list[dict[str, str]] = Field(default_factory=lambda: [
+        {"name": "[AUTHOR 1]", "institution": "[INSTITUTION / AFFILIATION]"},
+        {"name": "[AUTHOR 2]", "institution": "[INSTITUTION / AFFILIATION]"},
+        {"name": "[AUTHOR 3]", "institution": "[INSTITUTION / AFFILIATION]"},
+        {"name": "[AUTHOR 4]", "institution": "[INSTITUTION / AFFILIATION]"},
+        {"name": "[AUTHOR 5]", "institution": "[INSTITUTION / AFFILIATION]"},
+    ])
+    date: str = "[DATE]"
     sections: list[ReportSection] = Field(default_factory=list)
+    layout: dict = Field(default_factory=dict)
 
 
 class DiagramPayload(BaseModel):
     title: str
     diagram_type: ArtifactKind
     mermaid: str
+    explanation: str = ""
     nodes: list[dict] = Field(default_factory=list)
     edges: list[dict] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)

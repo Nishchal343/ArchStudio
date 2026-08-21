@@ -26,6 +26,17 @@ LANGUAGE_BY_EXTENSION: dict[str, str] = {
     ".xml": "xml", ".md": "markdown", ".markdown": "markdown",
 }
 
+DEFAULT_EXCLUDED_DIRECTORIES = {
+    ".git", ".github", "node_modules", "venv", ".venv", "env", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", "target", "coverage",
+    ".next", ".nuxt", ".cache", "vendor", "processed", "generated", "generated-artifacts",
+    "artifacts", "out", "release", "__macosx",
+}
+DEFAULT_EXCLUDED_FILE_PATTERNS = {
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.ico", "*.bmp", "*.tiff", "*.mp3",
+    "*.mp4", "*.mov", "*.avi", "*.woff", "*.woff2", "*.ttf", "*.otf", "*.map", "*.min.js", "*.min.css",
+}
+
 _PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----", re.IGNORECASE)
 _JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 _TOKEN_PATTERN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_\-]{20,}|github_pat_[A-Za-z0-9_\-]{20,}|AKIA[0-9A-Z]{16})\b")
@@ -139,7 +150,8 @@ def process_project_files(project_id: str) -> dict:
 
     max_file_size = settings.max_processing_file_size_mb * 1024 * 1024
     max_total_size = settings.max_total_source_size_mb * 1024 * 1024
-    excluded_directories = {item.lower() for item in settings.processing_excluded_directories} | {"processed"}
+    excluded_directories = {item.lower() for item in settings.processing_excluded_directories} | DEFAULT_EXCLUDED_DIRECTORIES | {"processed"}
+    excluded_file_patterns = list(settings.processing_excluded_file_patterns) + list(DEFAULT_EXCLUDED_FILE_PATTERNS)
     temp_directory = Path(tempfile.mkdtemp(prefix=".processed-", dir=root))
     excluded_directories.add(temp_directory.name.lower())
     chunks_directory = temp_directory / "chunks"
@@ -175,7 +187,7 @@ def process_project_files(project_id: str) -> dict:
                         skipped_files += 1
                         _warning(warnings, "Project file count limit exceeded")
                         continue
-                    if _is_excluded(candidate, settings.processing_excluded_file_patterns):
+                    if _is_excluded(candidate, excluded_file_patterns):
                         skipped_files += 1
                         continue
                     try:

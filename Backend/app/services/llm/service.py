@@ -1,6 +1,6 @@
 from .base import LLMProvider
-from .ollama import OllamaLLMProvider
+from .groq import GroqLLMProvider
 
 
 def get_llm_provider() -> LLMProvider:
-    return OllamaLLMProvider()
+    return GroqLLMProvider()

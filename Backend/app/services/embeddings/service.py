@@ -1,7 +1,10 @@
-from ...config import get_settings
+from functools import lru_cache
+
 from .base import EmbeddingProvider, EmbeddingProviderError
-from .ollama import OllamaEmbeddingProvider
+from .sentence_transformers import SentenceTransformerEmbeddingProvider
 
 
+@lru_cache(maxsize=1)
 def get_embedding_provider() -> EmbeddingProvider:
-    return OllamaEmbeddingProvider()
+    """Reuse the loaded local model across ingestion and retrieval requests."""
+    return SentenceTransformerEmbeddingProvider()

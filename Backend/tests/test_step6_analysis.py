@@ -3,7 +3,6 @@ import json
 from types import SimpleNamespace
 from uuid import UUID
 
-import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -12,7 +11,8 @@ from app.schemas import AnalysisResult
 from app.services.analysis import service as analysis_service
 from app.services.analysis.service import AnalysisServiceError, build_analysis_prompt, parse_analysis_result
 from app.services.llm.base import LLMProviderError
-from app.services.llm.ollama import OllamaLLMProvider
+from app.services.llm.groq import GroqLLMProvider
+from app.services.llm.service import get_llm_provider
 
 
 def run(coro):
@@ -44,31 +44,38 @@ class FakeClient:
 PROJECT_ID = UUID("27ce6a06-6e88-43e5-8dba-6a6cc165cda0")
 
 
-def test_llm_provider_uses_qwen_generate_endpoint(monkeypatch):
-    monkeypatch.setattr(get_settings(), "ollama_base_url", "http://ollama.test")
-    monkeypatch.setattr(get_settings(), "ollama_llm_model", "qwen2.5-coder:7b")
-    client = FakeClient([FakeResponse(200, {"response": '{"overview":"grounded"}'})])
-    provider = OllamaLLMProvider(client=client, max_retries=0)
+def test_groq_provider_uses_structured_chat_completions():
+    client = FakeClient([FakeResponse(200, {"choices": [{"message": {"content": '{"overview":"grounded"}'}}]})])
+    provider = GroqLLMProvider(api_key="test-key", client=client, max_retries=0)
+
     assert run(provider.generate("prompt")) == '{"overview":"grounded"}'
-    assert client.calls[0][0] == "http://ollama.test/api/generate"
+    assert client.calls[0][0] == "https://api.groq.com/openai/v1/chat/completions"
+    headers = client.calls[0][1]["headers"]
     payload = client.calls[0][1]["json"]
-    assert payload["model"] == "qwen2.5-coder:7b"
-    assert payload["stream"] is False
-    assert payload["format"] == "json"
+    assert headers["Authorization"] == "Bearer test-key"
+    assert payload["model"] == "qwen/qwen3.6-27b"
+    assert payload["response_format"] == {"type": "json_object"}
+
+    long_result = GroqLLMProvider(api_key="test-key", client=FakeClient([
+        FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]})
+    ]), max_retries=0)
+    run(long_result.generate("prompt", max_tokens=5000))
+    assert long_result.client.calls[0][1]["json"]["max_tokens"] == 5000
 
 
-def test_llm_provider_handles_model_and_connection_failures():
-    missing = OllamaLLMProvider(client=FakeClient([FakeResponse(404, {})]), max_retries=0)
-    with pytest.raises(LLMProviderError, match="model is unavailable"):
-        run(missing.generate("prompt"))
+def test_groq_provider_reports_safe_api_errors():
+    invalid_key = GroqLLMProvider(api_key="test-key", client=FakeClient([FakeResponse(401, {})]), max_retries=0)
+    with pytest.raises(LLMProviderError, match="key was rejected"):
+        run(invalid_key.generate("prompt"))
 
-    class FailingClient:
-        async def post(self, url, **kwargs):
-            raise httpx.ConnectError("refused", request=httpx.Request("POST", url))
+    malformed = GroqLLMProvider(api_key="test-key", client=FakeClient([FakeResponse(200, {})]), max_retries=0)
+    with pytest.raises(LLMProviderError, match="malformed"):
+        run(malformed.generate("prompt"))
 
-    unavailable = OllamaLLMProvider(client=FailingClient(), max_retries=0)
-    with pytest.raises(LLMProviderError, match="unavailable"):
-        run(unavailable.generate("prompt"))
+
+def test_provider_factory_uses_groq_by_default(monkeypatch):
+    monkeypatch.setattr(get_settings(), "groq_api_key", "test-key")
+    assert isinstance(get_llm_provider(), GroqLLMProvider)
 
 
 def test_prompt_requires_grounded_evidence_and_no_hallucination():
@@ -88,6 +95,16 @@ def test_analysis_result_parser_handles_json_fences_and_rejects_invalid_json():
         parse_analysis_result("not json", PROJECT_ID)
     with pytest.raises(AnalysisServiceError):
         parse_analysis_result("{}", PROJECT_ID)
+
+
+def test_analysis_result_parser_coerces_list_project_structure():
+    result = parse_analysis_result(json.dumps({
+        "overview": "Grounded overview",
+        "project_structure": ["frontend/index.html", "backend/app/main.py"],
+        "technology_stack": ["Python"],
+    }), PROJECT_ID)
+
+    assert result.project_structure == "- frontend/index.html\n- backend/app/main.py"
 
 
 def test_analysis_retrieves_focused_context_before_llm(monkeypatch):

@@ -1,6 +1,7 @@
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, status
+import httpx
 from supabase_auth.errors import AuthApiError
 
 from ..config import get_settings
@@ -52,7 +53,10 @@ def register(payload: RegisterRequest):
             {
                 "email": str(payload.email),
                 "password": payload.password,
-                "options": {"data": {"name": payload.name}},
+                "options": {
+                    "data": {"name": payload.name},
+                    "email_redirect_to": get_settings().email_confirmation_redirect_url,
+                },
             }
         )
         return auth_response(result)
@@ -73,7 +77,7 @@ def login(payload: LoginRequest):
 @router.post("/forgot-password", status_code=202)
 def forgot_password(payload: EmailRequest):
     try:
-        get_supabase().auth.reset_password_for_email(str(payload.email), {"redirect_to": get_settings().auth_redirect_url})
+        get_supabase().auth.reset_password_for_email(str(payload.email), {"redirect_to": get_settings().password_reset_redirect_url})
     except AuthApiError as error:
         log_auth_failure(error)
         raise auth_error(error)
@@ -81,17 +85,28 @@ def forgot_password(payload: EmailRequest):
 
 
 @router.post("/update-password")
-def update_password(payload: UpdatePasswordRequest):
+def update_password(payload: UpdatePasswordRequest, authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Recovery session required")
+    access_token = authorization[7:].strip()
     try:
-        result = get_supabase().auth.update_user({"password": payload.password})
-        return {"user": result.user.model_dump() if result.user else None}
-    except AuthApiError as error:
-        raise auth_error(error)
+        settings = get_settings()
+        response = httpx.put(
+            f"{settings.supabase_url.rstrip('/')}/auth/v1/user",
+            headers={"apikey": settings.supabase_anon_key, "Authorization": f"Bearer {access_token}"},
+            json={"password": payload.password}, timeout=20,
+        )
+        logger.warning("Supabase password update response status=%s body=%s", response.status_code, response.text[:500])
+        if response.status_code >= 400:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password reset link is invalid or expired")
+        return {"user": response.json()}
+    except httpx.HTTPError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Password reset service is unavailable")
 
 
 @router.get("/oauth/{provider}")
 def oauth_login(provider: str):
-    if provider not in {"google", "facebook", "apple", "x"}:
+    if provider not in {"google", "github"}:
         raise HTTPException(status_code=400, detail="Unsupported social provider")
     try:
         result = get_supabase().auth.sign_in_with_oauth({"provider": provider, "options": {"redirect_to": get_settings().auth_redirect_url}})

@@ -1,4 +1,4 @@
 from .base import EmbeddingProvider, EmbeddingProviderError
-from .ollama import OllamaEmbeddingProvider
+from .sentence_transformers import SentenceTransformerEmbeddingProvider
 
-__all__ = ["EmbeddingProvider", "EmbeddingProviderError", "OllamaEmbeddingProvider"]
+__all__ = ["EmbeddingProvider", "EmbeddingProviderError", "SentenceTransformerEmbeddingProvider"]

@@ -2,7 +2,7 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthRetryableError
 
 from .supabase_client import get_supabase
 
@@ -18,5 +18,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
         if not user:
             raise ValueError("No user in token response")
         return {"id": UUID(str(user.id)), "email": user.email, "raw": user}
+    except AuthRetryableError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Authentication service is temporarily unavailable") from error
     except (AuthApiError, ValueError, TypeError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired authentication token")

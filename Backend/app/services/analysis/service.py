@@ -103,6 +103,20 @@ def parse_analysis_result(text: str, project_id: UUID) -> AnalysisResult:
     if not any(payload.get(field) for field in core_fields):
         raise AnalysisServiceError("LLM returned empty structured analysis")
     payload["project_id"] = project_id
+    # The prompt describes these fields as prose, but models sometimes return
+    # a useful list/object representation (for example, a list of repository
+    # paths for project_structure). Coerce those values before schema
+    # validation so a shape variation does not discard the whole analysis.
+    for field in ("overview", "project_structure", "architecture", "summary"):
+        value = payload.get(field, "")
+        if isinstance(value, list):
+            payload[field] = "\n".join(f"- {item}" for item in value)
+        elif isinstance(value, dict):
+            payload[field] = "\n".join(f"{key}: {value}" for key, value in value.items())
+        elif value is None:
+            payload[field] = ""
+        elif not isinstance(value, str):
+            payload[field] = str(value)
     technology_stack = payload.get("technology_stack", [])
     if isinstance(technology_stack, dict):
         payload["technology_stack"] = [f"{name}: {description}" for name, description in technology_stack.items()]

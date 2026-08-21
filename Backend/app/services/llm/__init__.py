@@ -1,4 +1,4 @@
 from .base import LLMProvider, LLMProviderError
-from .ollama import OllamaLLMProvider
+from .groq import GroqLLMProvider
 
-__all__ = ["LLMProvider", "LLMProviderError", "OllamaLLMProvider"]
+__all__ = ["LLMProvider", "LLMProviderError", "GroqLLMProvider"]

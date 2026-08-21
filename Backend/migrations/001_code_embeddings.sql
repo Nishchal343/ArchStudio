@@ -1,4 +1,4 @@
--- Step 5: reversible pgvector index for Ollama nomic-embed-text (768 dimensions).
+-- Step 5: reversible pgvector index for Sentence Transformers nomic-embed-text-v1.5 (768 dimensions).
 -- Run with a database role allowed to manage extensions.
 CREATE EXTENSION IF NOT EXISTS vector;
 

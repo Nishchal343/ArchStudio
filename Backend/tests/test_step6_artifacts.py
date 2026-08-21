@@ -8,11 +8,16 @@ from app.schemas import DiagramPayload, EditableDocument, ReportSection
 from app.services.artifacts.diagrams import database_diagram, render_diagram
 from app.services.artifacts.export import export_document
 from app.services.chat.service import answer_project_question
+from app.services.artifacts.export import _section_break_indices
 
 
 def document():
     return EditableDocument(title="Test report", document_type="report",
                             sections=[ReportSection(heading="Overview", content="Actual repository evidence.")])
+
+
+def test_report_pagination_does_not_insert_artificial_section_breaks():
+    assert _section_break_indices(12, 10) == set()
 
 
 def test_document_exports_are_real_files():
@@ -55,3 +60,25 @@ def test_chat_is_grounded_and_returns_file_evidence(monkeypatch):
     result = asyncio.run(answer_project_question(None, uuid4(), "Where is auth?", 5, FakeProvider()))
     assert result.answer.startswith("Authentication")
     assert result.evidence[0].file_path == "app/auth.py"
+
+
+def test_chat_retries_vague_insufficient_evidence_answer(monkeypatch):
+    async def fake_search(*args, **kwargs):
+        return [{"file_path": "frontend/src/LoadingOverlay.jsx", "start_line": 10, "end_line": 20,
+                 "similarity": 0.8, "content": "if (loading) return null"}]
+
+    class RetryProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, prompt):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"answer":"Insufficient evidence","evidence":[]}'
+            return '{"answer":"The loading state should remain visible while data is being fetched.","evidence":[{"file_path":"frontend/src/LoadingOverlay.jsx"}]}'
+
+    monkeypatch.setattr("app.services.chat.service.search_project", fake_search)
+    provider = RetryProvider()
+    result = asyncio.run(answer_project_question(None, uuid4(), "What improvements can be made?", 5, provider))
+    assert provider.calls == 2
+    assert "loading state" in result.answer

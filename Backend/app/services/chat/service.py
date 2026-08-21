@@ -38,11 +38,25 @@ async def answer_project_question(db: AsyncSession, project_id: UUID, query: str
         total += len(block)
     prompt = (
         "Answer the user's question using only the repository evidence below. Do not invent code, "
-        "files, behavior, citations, or facts. If evidence is insufficient, say so. Return JSON only "
+        "files, behavior, citations, or facts. When the question asks for improvements or recommendations, "
+        "extract every actionable concern that is actually supported by the supplied files and explain why it "
+        "matters. Do not answer only 'Insufficient evidence' when partial evidence supports useful findings; "
+        "instead provide the supported findings and state that the list is not a complete audit. Return JSON only "
         "with keys answer and evidence; evidence is an array of file_path, start_line, end_line, similarity.\n\n"
         f"QUESTION:\n{query}\n\nEVIDENCE:\n{chr(10).join(context_parts)}"
     )
-    answer, cited = _parse_answer(await (provider or get_llm_provider()).generate(prompt))
+    llm = provider or get_llm_provider()
+    answer, cited = _parse_answer(await llm.generate(prompt))
+    if answer.lower().strip(" .:!-\n") in {"insufficient evidence", "insufficient evidence found"}:
+        retry_prompt = (
+            "The previous answer was too vague. Using only the same repository evidence, give a useful, "
+            "grounded response to the user's question. If it asks about improvements, list the concrete "
+            "improvement opportunities visible in the cited files, explain each briefly, and end by stating "
+            "that this is not a complete project audit. Never invent missing details. Return the same JSON "
+            "shape with answer and evidence.\n\n"
+            f"QUESTION:\n{query}\n\nEVIDENCE:\n{chr(10).join(context_parts)}"
+        )
+        answer, cited = _parse_answer(await llm.generate(retry_prompt))
     evidence = []
     for item in cited:
         if not isinstance(item, dict):

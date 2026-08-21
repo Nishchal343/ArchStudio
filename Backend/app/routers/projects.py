@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -30,12 +32,47 @@ from ..services.embeddings.base import EmbeddingProviderError
 from ..services.analysis.service import AnalysisServiceError, analyze_project
 from ..services.llm.base import LLMProviderError
 from ..services.artifacts.reports import generate_report
-from ..services.artifacts.diagrams import architecture_diagram, database_diagram, render_diagram
+from ..services.artifacts.diagrams import architecture_diagram, database_diagram, enrich_diagram_explanation, render_diagram
 from ..services.artifacts.export import export_document
 from ..services.chat.service import answer_project_question
+from ..services.literature_review import generate_literature_review
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 logger = logging.getLogger(__name__)
+EMBEDDING_ESTIMATE_SECONDS_PER_CHUNK = 6.5
+STALE_EMBEDDING_MINUTES = 20
+
+
+@router.post("/{project_id}/literature-review")
+async def literature_review(project_id: UUID, urls: str = Form("[]"), files: list[UploadFile] = File(default=[]),
+                            current_user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    project = await get_owned_project(db, project_id, current_user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.status != ProjectStatus.EMBEDDED:
+        raise HTTPException(status_code=409, detail="Project must be embedded before literature comparison.")
+    try:
+        parsed_urls = json.loads(urls)
+        if not isinstance(parsed_urls, list):
+            raise ValueError("URLs must be a JSON array.")
+        return await generate_literature_review(db, project_id, [str(url) for url in parsed_urls if str(url).strip()], files)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Literature review failed")
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def initial_embedding_status(chunks_path: Path) -> str:
+    try:
+        total_chunks = sum(1 for line in chunks_path.open("r", encoding="utf-8") if line.strip())
+    except OSError:
+        total_chunks = 0
+    if not total_chunks:
+        return "Embedding generation started. Estimating time remaining…"
+    seconds = max(60, round(total_chunks * EMBEDDING_ESTIMATE_SECONDS_PER_CHUNK))
+    minutes = max(1, round(seconds / 60))
+    return f"Embedding generation started. Your project should be ready in about {minutes} minutes."
 
 
 def project_name(value: str | None, filename: str | None = None) -> str:
@@ -46,6 +83,22 @@ def project_name(value: str | None, filename: str | None = None) -> str:
     safe_filename = (filename or "").replace("\\", "/")
     stem = Path(safe_filename).stem.strip()
     return stem or "Untitled project"
+
+
+async def recover_stale_embedding_project(project: Project, db: AsyncSession) -> bool:
+    if project.status != ProjectStatus.EMBEDDING or not project.updated_at:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_EMBEDDING_MINUTES)
+    updated_at = project.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    if updated_at >= cutoff:
+        return False
+    project.status = ProjectStatus.PROCESSED
+    project.status_message = "Previous embedding job stopped before completion. Rebuild the AI index to retry."
+    await db.commit()
+    logger.warning("Recovered stale embedding project_id=%s", project.id)
+    return True
 
 
 def upload_error(error: StorageValidationError) -> HTTPException:
@@ -176,38 +229,67 @@ async def process_project_in_background(project_id: str) -> None:
 
 async def embed_project_in_background(project_id: str) -> None:
     started = asyncio.get_running_loop().time()
-    async with SessionLocal() as db:
-        try:
-            stats = await ingest_project(db, uuid.UUID(project_id))
+    try:
+        async def report_progress(stats) -> None:
+            completed = stats.embedded_chunks + stats.skipped_chunks
+            if not stats.total_chunks or not completed:
+                return
+            elapsed = asyncio.get_running_loop().time() - started
+            remaining = max(0, stats.total_chunks - completed)
+            estimate_seconds = int(elapsed * remaining / completed)
+            if estimate_seconds >= 60:
+                estimate = f"about {max(1, round(estimate_seconds / 60))} min remaining"
+            else:
+                estimate = f"about {max(1, estimate_seconds)} sec remaining"
+            async with SessionLocal() as progress_db:
+                result = await progress_db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+                progress_project = result.scalar_one_or_none()
+                if progress_project and progress_project.status == ProjectStatus.EMBEDDING:
+                    progress_project.status_message = f"Embedding {completed}/{stats.total_chunks} chunks; {estimate}."
+                    await progress_db.commit()
+
+        # The worker owns this session. It never inherits the request-scoped
+        # session, and the context closes it even when embedding or PostgreSQL fails.
+        async with SessionLocal() as db:
+            stats = await ingest_project(db, uuid.UUID(project_id), progress=report_progress)
+        async with SessionLocal() as db:
             result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
             project = result.scalar_one_or_none()
             if project:
                 project.status = ProjectStatus.EMBEDDED
                 project.status_message = "Embedding index completed."
                 await db.commit()
-            logger.info("Embedding job completed project_id=%s embedded_chunks=%s duration_seconds=%.3f",
-                        project_id, stats.embedded_chunks, asyncio.get_running_loop().time() - started)
-        except EmbeddingIngestionError as error:
-            await db.rollback()
-            result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
-            project = result.scalar_one_or_none()
-            if project:
-                project.status = ProjectStatus.FAILED
-                if isinstance(error.__cause__, EmbeddingProviderError):
-                    project.status_message = "Local embedding service is unavailable."
-                else:
-                    project.status_message = "Embedding index failed. Retry after reviewing processed output."
-                await db.commit()
-            logger.exception("Embedding job failed project_id=%s", project_id)
+        logger.info("Embedding job completed project_id=%s embedded_chunks=%s extraction_seconds=%.3f chunking_seconds=%.3f embedding_seconds=%.3f pgvector_seconds=%.3f duration_seconds=%.3f batch_size=%s concurrency=%s throughput_chunks_per_second=%.3f",
+                    project_id, stats.embedded_chunks, stats.extraction_seconds, stats.chunking_seconds,
+                    stats.embedding_seconds, stats.pgvector_seconds, asyncio.get_running_loop().time() - started,
+                    stats.batch_size, stats.concurrency, stats.throughput_chunks_per_second)
+    except EmbeddingIngestionError as error:
+        try:
+            async with SessionLocal() as db:
+                result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+                project = result.scalar_one_or_none()
+                if project:
+                    project.status = ProjectStatus.FAILED
+                    if isinstance(error.__cause__, EmbeddingProviderError):
+                        project.status_message = "Local embedding service is unavailable."
+                    else:
+                        project.status_message = "Embedding index failed. Retry after reviewing processed output."
+                    await db.commit()
         except Exception:
-            await db.rollback()
-            result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
-            project = result.scalar_one_or_none()
-            if project:
-                project.status = ProjectStatus.FAILED
-                project.status_message = "Embedding index failed."
-                await db.commit()
-            logger.exception("Unexpected embedding failure project_id=%s", project_id)
+            logger.exception("Could not persist embedding failure status project_id=%s", project_id)
+        logger.exception("Embedding job failed project_id=%s", project_id)
+    except Exception:
+        try:
+            async with SessionLocal() as db:
+                result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+                project = result.scalar_one_or_none()
+                if project:
+                    project.status = ProjectStatus.FAILED
+                    project.status_message = "Embedding index failed."
+                    await db.commit()
+        except Exception:
+            logger.exception("Could not persist unexpected embedding failure status project_id=%s", project_id)
+        logger.exception("Unexpected embedding failure project_id=%s", project_id)
 
 
 async def analyze_project_in_background(analysis_id: str) -> None:
@@ -267,10 +349,11 @@ async def embed_project(project_id: UUID, background_tasks: BackgroundTasks,
     if project.status not in {ProjectStatus.PROCESSED, ProjectStatus.EMBEDDED, ProjectStatus.FAILED}:
         raise HTTPException(status_code=409, detail="Project must be processed before embedding.")
     project.status = ProjectStatus.EMBEDDING
-    project.status_message = "Embedding generation started."
+    project.status_message = initial_embedding_status(chunks_path)
     await db.commit()
     background_tasks.add_task(embed_project_in_background, str(project.id))
-    logger.info("Embedding job started project_id=%s model=%s", project.id, get_settings().ollama_embedding_model)
+    logger.info("Embedding job started project_id=%s model=%s device=%s", project.id,
+                get_settings().embedding_model, get_settings().embedding_device)
     return ProcessingStartResponse(project_id=project.id, status=ProjectStatus.EMBEDDING, message="Embedding generation started.")
 
 
@@ -320,7 +403,7 @@ async def analyze_project_endpoint(project_id: UUID, background_tasks: Backgroun
     await db.refresh(analysis)
     background_tasks.add_task(analyze_project_in_background, str(analysis.id))
     logger.info("Project analysis started project_id=%s analysis_id=%s model=%s",
-                project_id, analysis.id, get_settings().ollama_llm_model)
+                project_id, analysis.id, get_settings().groq_model)
     return AnalysisStartResponse(project_id=project_id, analysis_id=analysis.id,
                                  status=AnalysisStatus.QUEUED.value,
                                  message="Project analysis started.")
@@ -358,22 +441,41 @@ async def generate_artifact_in_background(artifact_id: str) -> None:
             if artifact.kind in {ArtifactKind.REPORT, ArtifactKind.IEEE_REPORT, ArtifactKind.RESEARCH_PAPER}:
                 payload = (await generate_report(db, artifact.project_id, artifact.kind.value)).model_dump(mode="json")
             elif artifact.kind == ArtifactKind.DATABASE_DIAGRAM:
-                payload = database_diagram(artifact.project_id).model_dump(mode="json")
+                diagram = await enrich_diagram_explanation(database_diagram(artifact.project_id))
+                diagram.mermaid = f"%% ARCHSTUDIO_EXPLANATION {diagram.explanation.replace(chr(10), ' ')}\n{diagram.mermaid}"
+                payload = diagram.model_dump(mode="json")
             else:
-                payload = (await architecture_diagram(db, artifact.project_id)).model_dump(mode="json")
+                diagram = await architecture_diagram(db, artifact.project_id)
+                diagram = await enrich_diagram_explanation(diagram)
+                diagram.mermaid = f"%% ARCHSTUDIO_EXPLANATION {diagram.explanation.replace(chr(10), ' ')}\n{diagram.mermaid}"
+                payload = diagram.model_dump(mode="json")
             artifact.payload = payload
             artifact.status = ArtifactStatus.COMPLETED
             artifact.error_message = None
             await db.commit()
-        except Exception:
+        except Exception as error:
             await db.rollback()
             result = await db.execute(select(ProjectArtifact).where(ProjectArtifact.id == uuid.UUID(artifact_id)))
             artifact = result.scalar_one_or_none()
             if artifact:
                 artifact.status = ArtifactStatus.FAILED
-                artifact.error_message = "Artifact generation failed."
+                artifact.error_message = artifact_generation_error_message(error)
                 await db.commit()
             logger.exception("Artifact generation failed artifact_id=%s", artifact_id)
+
+
+def artifact_generation_error_message(error: Exception) -> str:
+    """Expose actionable provider failures without leaking internal details."""
+    cause = error
+    while cause:
+        if isinstance(cause, LLMProviderError):
+            return str(cause)
+        if isinstance(cause, EmbeddingProviderError):
+            return str(cause)
+        cause = cause.__cause__
+    if isinstance(error, AnalysisServiceError):
+        return "Grounded project analysis could not be generated."
+    return "Artifact generation failed. Please try again."
 
 
 async def queue_artifact(project_id: UUID, kind: ArtifactKind, background_tasks: BackgroundTasks,
@@ -617,7 +719,17 @@ async def get_project(project_id: UUID, current_user: dict = Depends(get_current
     project = await get_owned_project(db, project_id, current_user["id"])
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    await recover_stale_embedding_project(project, db)
     return project
+
+
+@router.get("/{project_id}/artifacts", response_model=list[ArtifactStatusResponse])
+async def list_artifacts(project_id: UUID, current_user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    project = await get_owned_project(db, project_id, current_user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    result = await db.execute(select(ProjectArtifact).where(ProjectArtifact.project_id == project_id).order_by(ProjectArtifact.updated_at.desc()))
+    return [await get_artifact(project_id, artifact.id, current_user, db) for artifact in result.scalars().all()]
 
 
 @router.delete("/{project_id}", status_code=204, summary="Delete one of the current user's projects")

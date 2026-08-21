@@ -1,0 +1,16 @@
+# Local secrets and runtime state
+.env
+Backend/.env
+Backend/storage/projects/
+
+# Python and frontend build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+Backend/.venv/
+Frontend/node_modules/
+Frontend/dist/
+
+# Docker/local tooling
+.docker/

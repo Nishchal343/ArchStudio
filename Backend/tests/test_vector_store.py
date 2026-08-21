@@ -24,7 +24,7 @@ def test_upsert_and_cosine_query_retain_vector_bind_type():
         file_path="file.py",
         content_hash="a" * 64,
         embedding=vector,
-        embedding_model="nomic-embed-text",
+        embedding_model="nomic-ai/nomic-embed-text-v1.5",
         embedding_dimension=768,
     )
     compiled_insert = statement.compile(dialect=dialect())

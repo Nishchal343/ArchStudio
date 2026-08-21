@@ -7,5 +7,5 @@ class LLMProviderError(RuntimeError):
 
 class LLMProvider(ABC):
     @abstractmethod
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, max_tokens: int | None = None) -> str:
         raise NotImplementedError
