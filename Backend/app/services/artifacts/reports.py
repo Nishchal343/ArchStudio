@@ -1,7 +1,7 @@
 import asyncio
 from uuid import UUID
 import json
-import re
+import logging
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,8 @@ from ..rag.retrieval import search_project
 from ..llm.service import get_llm_provider
 from ...config import get_settings
 from .templates import predefined_template
+
+logger = logging.getLogger(__name__)
 
 USER_INPUT_SECTIONS = {
     "Literature Review": "USER INPUT REQUIRED — Enter the literature review here.",
@@ -197,7 +199,7 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
 
     async def retrieve_for_heading(heading: str) -> tuple[str, str]:
         async with SessionLocal() as section_db:
-            results = await search_project(section_db, project_id, heading, top_k=6,
+            results = await search_project(section_db, project_id, heading, top_k=8,
                                            min_similarity=settings.analysis_min_similarity)
         context = "\n\n".join(
             f"FILE: {r['file_path']}:{r.get('start_line')}-{r.get('end_line')}\n{r['content']}"
@@ -208,7 +210,16 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
     # Retrieval can remain heading-focused, but the LLM receives every heading
     # and all evidence in one request so it can write a coherent paper with
     # consistent depth and transitions instead of isolated one-line sections.
-    retrieved = dict(await asyncio.gather(*(retrieve_for_heading(heading) for heading in headings)))
+    # Keep retrieval concurrent, but bounded.  Each search performs an embedding
+    # request and a database query; launching all twelve at once exhausts the
+    # database pool and causes intermittent 503s while the UI is polling.
+    retrieval_semaphore = asyncio.Semaphore(3)
+
+    async def bounded_retrieve(heading: str) -> tuple[str, str]:
+        async with retrieval_semaphore:
+            return await retrieve_for_heading(heading)
+
+    retrieved = dict(await asyncio.gather(*(bounded_retrieve(heading) for heading in headings)))
     evidence = "\n\n".join(f"## {heading}\n{retrieved[heading]}" for heading in headings)
     analysis_json = json.dumps(analysis.model_dump(mode="json"), ensure_ascii=False)
     heading_json = json.dumps(headings, ensure_ascii=False)
@@ -223,7 +234,7 @@ Target layout: {template['layout']['columns']} column(s).
 Target length: {template['layout']['page_target']} and approximately {template['layout']['target_words']} words of actual content. Write enough connected prose to reach that target; do not pad with blank lines or repeat the same point.
 Writing style: {template['layout']['depth']}. Make the sections flow as one paper, with useful paragraphs rather than one-line summaries.
 
-Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, explicitly explain when external evidence is unavailable while still providing relevant repository-grounded discussion.
+Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. For every technical section, explain the relevant evidence in detail and cite the supplied FILE and line range in prose where useful. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, explicitly explain when external evidence is unavailable while still providing relevant repository-grounded discussion. The user may paste material from the separate Research/Literature Review feature into those four sections after generation; leave those sections clearly editable and do not fabricate external literature.
 
 COMPLETE PROJECT ANALYSIS:
 {analysis_json}
@@ -239,7 +250,9 @@ HEADING-RELATED REPOSITORY EVIDENCE:
             str(item.get("heading", "")).strip().lower(): item.get("content")
             for item in (generated or []) if isinstance(item, dict)
         }
-    except Exception:
+    except Exception as error:
+        logger.warning("Report LLM response was unusable project_id=%s document_type=%s error=%s",
+                       project_id, document_type, type(error).__name__)
         by_heading = {}
 
     first_pass_sections = [
@@ -248,49 +261,10 @@ HEADING-RELATED REPOSITORY EVIDENCE:
         for heading in headings
     ]
 
-    # A second pass expands only the content produced by the first pass. It
-    # does not receive repository evidence or any new instructions about the
-    # project, so it can improve continuity and paragraph length without
-    # introducing unsupported facts.
-    first_pass_json = json.dumps(
-        [{"heading": heading, "content": content} for heading, content in first_pass_sections],
-        ensure_ascii=False,
-    )
-    expansion_prompt = f"""Rewrite the supplied report content for presentation.
-Return exactly one valid JSON object with this shape:
-{{"sections": [{{"heading": "same heading", "content": "exactly two paragraphs"}}]}}
-
-Use every supplied heading exactly once, in the same order. For every heading, write exactly two substantial paragraphs separated by one blank line. Preserve the meaning and facts of the supplied content. Expand wording and improve transitions only; do not add facts, citations, metrics, technologies, headings, placeholders, or information from outside the supplied content. Return no title, commentary, markdown fences, or content outside the JSON object.
-
-FIRST-PASS CONTENT ONLY:
-{first_pass_json}
-"""
+    # The first pass already receives the complete analysis and all retrieved
+    # evidence. A second full-document LLM call doubled generation time and
+    # frequently hit the provider timeout, without adding new evidence.
     sections = first_pass_sections
-    try:
-        expanded_raw = await get_llm_provider().generate(
-            expansion_prompt, max_tokens=template["layout"]["output_tokens"]
-        )
-        expanded_payload = json.loads(expanded_raw)
-        expanded_items = expanded_payload.get("sections") if isinstance(expanded_payload, dict) else None
-        expanded_by_heading = {
-            str(item.get("heading", "")).strip().lower(): item.get("content")
-            for item in (expanded_items or []) if isinstance(item, dict)
-        }
-        expanded_sections = []
-        for heading, original_content in first_pass_sections:
-            content = expanded_by_heading.get(heading.lower())
-            if isinstance(content, str) and content.strip():
-                paragraphs = [part.strip() for part in re.split(r"\n\s*\n", content) if part.strip()]
-                if len(paragraphs) == 2:
-                    expanded_sections.append((heading, "\n\n".join(paragraphs)))
-                else:
-                    expanded_sections.append((heading, original_content))
-            else:
-                expanded_sections.append((heading, original_content))
-        if len(expanded_sections) == len(first_pass_sections):
-            sections = expanded_sections
-    except Exception:
-        pass
     return EditableDocument(title="USER INPUT REQUIRED — Enter paper title", document_type=document_type,
                             authors=[{"name": "USER INPUT REQUIRED — Enter author name", "institution": ""}],
                             date="",

@@ -46,11 +46,16 @@ class Settings(BaseSettings):
     max_project_files: int = 10000
     max_total_source_size_mb: int = 500
     max_chunk_size: int = 4000
+    embedding_provider: str = "auto"
+    embedding_query_provider: str = "local"
     embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
     embedding_device: str = "auto"
     embedding_batch_size: int = Field(default=32, gt=0, le=128)
     embedding_concurrency: int = Field(default=2, ge=1, le=4)
     embedding_max_retries: int = Field(default=2, ge=0, le=5)
+    lightning_embedding_url: str | None = None
+    lightning_api_key: str | None = None
+    lightning_embedding_timeout: float = Field(default=120.0, gt=0, le=900)
     groq_api_key: str | None = None
     groq_model: str = "qwen/qwen3.6-27b"
     groq_timeout: float = Field(default=120.0, gt=0, le=900)
@@ -60,8 +65,8 @@ class Settings(BaseSettings):
     rag_max_top_k: int = Field(default=20, gt=0, le=100)
     rag_min_similarity: float = Field(default=0.5, ge=0, le=1)
     rag_max_query_length: int = Field(default=2000, gt=0, le=10000)
-    analysis_max_context_chunks: int = Field(default=5, gt=0, le=100)
-    analysis_max_context_chars: int = Field(default=12000, gt=1000, le=200000)
+    analysis_max_context_chunks: int = Field(default=10, gt=0, le=100)
+    analysis_max_context_chars: int = Field(default=24000, gt=1000, le=200000)
     analysis_min_similarity: float = Field(default=0.0, ge=-1.0, le=1.0)
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")

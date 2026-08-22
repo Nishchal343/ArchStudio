@@ -1,6 +1,10 @@
 # Local secrets and runtime state
 .env
 Backend/.env
+*.env.production
+*.db
+*.sqlite
+*.sqlite3
 Backend/storage/projects/
 
 # Python and frontend build artifacts
@@ -14,3 +18,5 @@ Frontend/dist/
 
 # Docker/local tooling
 .docker/
+*.log
+model_cache/

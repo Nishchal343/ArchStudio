@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...services.embeddings.base import EmbeddingProvider
-from ...services.embeddings.service import get_embedding_provider
+from ...services.embeddings.service import get_query_embedding_provider
 from ...services.storage_service import project_directory
 if TYPE_CHECKING:
     from ..vector_store.pgvector import PgVectorStore
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 async def search_project(db: AsyncSession, project_id: UUID, query: str, top_k: int, min_similarity: float,
                          provider: EmbeddingProvider | None = None, store: "PgVectorStore | None" = None) -> list[dict]:
-    provider = provider or get_embedding_provider()
+    provider = provider or get_query_embedding_provider()
     if store is None:
         from ..vector_store.pgvector import PgVectorStore
         store = PgVectorStore()

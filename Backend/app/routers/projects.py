@@ -438,6 +438,9 @@ async def generate_artifact_in_background(artifact_id: str) -> None:
                 return
             artifact.status = ArtifactStatus.GENERATING
             await db.commit()
+            started = asyncio.get_running_loop().time()
+            logger.info("Artifact generation started artifact_id=%s kind=%s project_id=%s",
+                        artifact.id, artifact.kind.value, artifact.project_id)
             if artifact.kind in {ArtifactKind.REPORT, ArtifactKind.IEEE_REPORT, ArtifactKind.RESEARCH_PAPER}:
                 payload = (await generate_report(db, artifact.project_id, artifact.kind.value)).model_dump(mode="json")
             elif artifact.kind == ArtifactKind.DATABASE_DIAGRAM:
@@ -446,13 +449,15 @@ async def generate_artifact_in_background(artifact_id: str) -> None:
                 payload = diagram.model_dump(mode="json")
             else:
                 diagram = await architecture_diagram(db, artifact.project_id)
-                diagram = await enrich_diagram_explanation(diagram)
                 diagram.mermaid = f"%% ARCHSTUDIO_EXPLANATION {diagram.explanation.replace(chr(10), ' ')}\n{diagram.mermaid}"
                 payload = diagram.model_dump(mode="json")
             artifact.payload = payload
             artifact.status = ArtifactStatus.COMPLETED
             artifact.error_message = None
             await db.commit()
+            logger.info("Artifact generation completed artifact_id=%s kind=%s duration_seconds=%.3f",
+                        artifact.id, artifact.kind.value,
+                        asyncio.get_running_loop().time() - started)
         except Exception as error:
             await db.rollback()
             result = await db.execute(select(ProjectArtifact).where(ProjectArtifact.id == uuid.UUID(artifact_id)))

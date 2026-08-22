@@ -6,10 +6,8 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...config import get_settings
 from ...schemas import DiagramPayload
 from ..llm.service import get_llm_provider
-from ..rag.retrieval import search_project
 from ..storage_service import project_directory
 
 
@@ -32,16 +30,18 @@ def mermaid_from_graph(nodes: list[dict], edges: list[dict]) -> str:
 
 
 def _architecture_explanation(nodes: list[dict], edges: list[dict]) -> str:
-    sources = [node["label"] for node in nodes if node.get("kind") == "source"]
+    sources = [node["label"] for node in nodes if node.get("kind") not in {"output", "note"}]
     if not sources:
         return "No architecture relationships were supported by the indexed repository evidence."
+    labels = {node["id"]: node["label"] for node in nodes}
     relationships = "; ".join(
-        f"{edge['source']} {edge.get('label', 'connects to')} {edge['target']}" for edge in edges
+        f"{labels.get(edge['source'], edge['source'])} {edge.get('label', 'connects to')} "
+        f"{labels.get(edge['target'], edge['target'])}" for edge in edges
     ) or "No explicit relationships were detected in the retrieved source snippets."
-    return ("This diagram summarizes the repository components identified by the architecture search. "
+    return ("This diagram summarizes the repository components identified from the processed source files. "
             f"The source files represented are {', '.join(sources)}. "
             f"The detected relationships are: {relationships}. "
-            "These are source-level relationships from retrieved evidence, not a complete runtime trace.")
+            "Relationships are included only when supported by file paths or source references; this is not a complete runtime trace.")
 
 
 async def enrich_diagram_explanation(payload: DiagramPayload) -> DiagramPayload:
@@ -66,52 +66,103 @@ DIAGRAM STRUCTURE:
 
 
 async def architecture_diagram(db: AsyncSession, project_id: UUID) -> DiagramPayload:
-    results = await search_project(db, project_id,
-                                   "main entry point architecture data flow libraries runtime output",
-                                   top_k=6, min_similarity=get_settings().analysis_min_similarity)
+    """Build a repository-wide graph using generic source and dependency signals."""
+    del db
+    chunks_path = project_directory(str(project_id)) / "processed" / "chunks" / "chunks.jsonl"
+    files: dict[str, str] = {}
+    if chunks_path.is_file():
+        with chunks_path.open("r", encoding="utf-8") as source:
+            for line in source:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                path = str(item.get("file_path") or "")
+                if path:
+                    files[path] = files.get(path, "") + "\n" + str(item.get("content") or "")
+
     nodes: list[dict] = []
     edges: list[dict] = []
-    seen: set[str] = set()
-    for result in results:
-        path = result["file_path"]
-        if path not in seen:
-            node = {"id": _node_id(path, len(nodes)), "label": path, "kind": "source"}
-            nodes.append(node)
-            seen.add(path)
-        source_id = next(node["id"] for node in nodes if node["label"] == path)
-        content = result.get("content", "")
-        for include in re.findall(r"#include\s*[<\"]([^>\"]+)", content):
-            label = include.split("/")[-1]
-            if label not in seen:
-                lib = {"id": _node_id(label, len(nodes)), "label": label, "kind": "library"}
-                nodes.append(lib)
-                seen.add(label)
-            target_id = next(node["id"] for node in nodes if node["label"] == label)
-            if not any(edge["source"] == source_id and edge["target"] == target_id for edge in edges):
-                edges.append({"source": source_id, "target": target_id, "label": "includes"})
-        if "glutMainLoop" in content or "glut" in content.lower():
-            label = "GLUT runtime"
-            if label not in seen:
-                nodes.append({"id": _node_id(label, len(nodes)), "label": label, "kind": "runtime"})
-                seen.add(label)
-            runtime_id = next(node["id"] for node in nodes if node["label"] == label)
-            if not any(edge["source"] == source_id and edge["target"] == runtime_id for edge in edges):
-                edges.append({"source": source_id, "target": runtime_id, "label": "runs"})
-    # Retrieval can return several source files without explicit include
-    # statements in the retrieved snippets. Keep the diagram connected so it
-    # communicates a dependency flow instead of showing unrelated boxes.
-    source_nodes = [node for node in nodes if node["kind"] == "source"]
-    if len(source_nodes) > 1:
-        for source, target in zip(source_nodes, source_nodes[1:]):
-            if not any(edge["source"] == source["id"] and edge["target"] == target["id"] for edge in edges):
-                edges.append({"source": source["id"], "target": target["id"], "label": "depends on"})
+    ids: dict[str, str] = {}
+
+    def add_node(key: str, label: str, kind: str = "source") -> str:
+        if key not in ids:
+            ids[key] = _node_id(key, len(nodes))
+            nodes.append({"id": ids[key], "label": label, "kind": kind})
+        return ids[key]
+
+    def add_edge(source: str | None, target: str | None, label: str) -> None:
+        if not source or not target or source == target:
+            return
+        if not any(edge["source"] == source and edge["target"] == target for edge in edges):
+            edges.append({"source": source, "target": target, "label": label})
+
+    ignored = {".md", ".rst", ".txt", ".pdf", ".doc", ".docx", ".lock"}
+    source_paths = [path for path in files if Path(path).suffix.lower() not in ignored]
+    key_names = {"main", "app", "application", "server", "index", "route", "api", "pipeline", "service", "models", "settings"}
+    capability_patterns = {
+        "OCR / document vision": r"\b(?:ocr|paddleocr|tesseract|easyocr)\b",
+        "Machine learning": r"\b(?:torch|pytorch|tensorflow|sklearn|scikit-learn|keras|transformers|yolo)\b",
+        "Blockchain / smart contract": r"\b(?:blockchain|ethereum|web3|solidity|ganache)\b",
+        "Database / persistence": r"\b(?:sqlalchemy|django\.db|mongoose|sequelize|prisma|postgres|mysql|sqlite)\b",
+    }
+
+    def score(path: str) -> float:
+        name = Path(path).stem.lower()
+        value = 1.0 + min(len(files[path]) / 8000, 3)
+        if name in key_names or any(token in name for token in key_names if token.strip()):
+            value += 5
+        if any(part.lower() in {"src", "app", "backend", "frontend", "server", "services"} for part in Path(path).parts):
+            value += 2
+        if any(part.lower() in {"test", "tests", "docs", "documentation", "node_modules"} for part in Path(path).parts):
+            value -= 8
+        return value
+
+    selected = sorted(source_paths, key=score, reverse=True)[:18]
+    for pattern in capability_patterns.values():
+        selected.extend(path for path in source_paths if re.search(pattern, files[path], re.IGNORECASE) and path not in selected[:24])
+    selected = list(dict.fromkeys(selected))[:24]
+    for path in selected:
+        add_node(path, path)
+
+    # Resolve common internal import forms to actual indexed files.
+    def imported_stems(content: str, suffix: str) -> set[str]:
+        refs: set[str] = set()
+        if suffix == ".py":
+            refs.update(re.findall(r"(?:from|import)\s+([A-Za-z_][\w.]*)", content))
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            refs.update(re.findall(r"(?:from|require\()\s*[\"']([^\"']+)", content))
+        else:
+            refs.update(re.findall(r"#include\s*[<\"]([^>\"]+)", content))
+        return {ref.replace("\\", "/").rstrip("/").split("/")[-1].split(".")[0].lower() for ref in refs}
+
+    for path in selected:
+        source_id = ids[path]
+        stems = imported_stems(files[path], Path(path).suffix.lower())
+        for target in selected:
+            if target == path:
+                continue
+            target_stem = Path(target).stem.lower()
+            if target_stem in stems:
+                add_edge(source_id, ids[target], "imports")
+
+    for capability, pattern in capability_patterns.items():
+        evidence = [path for path in selected if re.search(pattern, files[path], re.IGNORECASE)]
+        if evidence:
+            capability_id = add_node(f"capability:{capability}", capability, "capability")
+            for path in evidence[:6]:
+                add_edge(ids[path], capability_id, "provides")
+
+    for path in source_paths:
+        if Path(path).name.lower() not in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}:
+            continue
+        runtime_id = add_node(f"runtime:{path}", f"Container runtime ({path})", "runtime")
+        for target in selected:
+            if target != path and (Path(target).suffix.lower() in {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs"}):
+                add_edge(runtime_id, ids[target], "orchestrates")
+
     if not nodes:
-        nodes = [{"id": "n0_empty", "label": "No architecture evidence detected", "kind": "note"}]
-    if any(node["kind"] == "source" for node in nodes) and any("gl" in node["label"].lower() for node in nodes):
-        output = {"id": "n_output", "label": "Rendered application output", "kind": "output"}
-        nodes.append(output)
-        source = next(node for node in nodes if node["kind"] == "source")
-        edges.append({"source": source["id"], "target": output["id"], "label": "renders"})
+        nodes = [{"id": "n0_empty", "label": "No processed source evidence detected", "kind": "note"}]
     return DiagramPayload(title="Architecture and Data Flow", diagram_type="architecture_diagram",
                           mermaid=mermaid_from_graph(nodes, edges),
                           explanation=_architecture_explanation(nodes, edges), nodes=nodes, edges=edges)
@@ -120,6 +171,7 @@ async def architecture_diagram(db: AsyncSession, project_id: UUID) -> DiagramPay
 def database_diagram(project_id: UUID) -> DiagramPayload:
     path = project_directory(str(project_id)) / "processed" / "chunks" / "chunks.jsonl"
     tables: dict[str, list[tuple[str, str]]] = {}
+    foreign_keys: set[tuple[str, str, str]] = set()
     if path.is_file():
         with path.open("r", encoding="utf-8") as source:
             for line in source:
@@ -140,8 +192,74 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                         column_type = (re.search(r"(?:String|Integer|Boolean|DateTime|UUID|JSON)", declaration) or ["unknown"])[0]
                         if (column, column_type) not in tables[table]:
                             tables[table].append((column, column_type))
-                for table, column, typ in re.findall(r"CREATE TABLE\s+(\w+).*?\b(\w+)\s+([A-Za-z]+)", content, re.IGNORECASE | re.DOTALL):
-                    tables.setdefault(table, []).append((column, typ))
+                        target = re.search(r"ForeignKey\(\s*[\"']([^\"']+)[\"']", declaration)
+                        if target:
+                            target_table, _, target_column = target.group(1).partition(".")
+                            foreign_keys.add((table, target_table, column))
+                    for column, declaration in re.findall(
+                        r"^\s{4}(\w+)\s*=\s*Column\(([^\n]*)\)", class_match.group("body"), re.MULTILINE
+                    ):
+                        column_type = (re.search(r"(?:String|Integer|Boolean|DateTime|Text|JSON|UUID)", declaration) or ["unknown"])[0]
+                        if (column, column_type) not in tables[table]:
+                            tables[table].append((column, column_type))
+                        target = re.search(r"ForeignKey\(\s*[\"']([^\"']+)[\"']", declaration)
+                        if target:
+                            target_table, _, _ = target.group(1).rpartition(".")
+                            foreign_keys.add((table, target_table, column))
+                    # Also recognize conventional *_id fields when a foreign-key
+                    # constraint is not present in the source model.
+                    for column, _ in tables[table]:
+                        if column.endswith("_id"):
+                            stem = column[:-3]
+                            candidates = [stem, f"{stem}s", stem.rstrip("s")]
+                            target_table = next((candidate for candidate in candidates if candidate in tables), None)
+                            if target_table and target_table != table:
+                                foreign_keys.add((table, target_table, column))
+                for table_match in re.finditer(
+                    r"CREATE TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(\w+)\s*\((?P<body>.*?)(?=\n[ \t]+\)(?:\s|$))",
+                    content, re.IGNORECASE | re.DOTALL
+                ):
+                    table = table_match.group(1)
+                    body = table_match.group("body")
+                    tables.setdefault(table, [])
+                    for column, declaration in re.findall(
+                        r"^\s*(\w+)\s+([A-Za-z]+(?:\s*\([^\n]*?\))?(?:\s+[A-Za-z]+)*)(?=\s*(?:,|$))",
+                        body, re.MULTILINE
+                    ):
+                        if column.upper() not in {"FOREIGN", "PRIMARY", "UNIQUE", "CHECK", "CONSTRAINT"}:
+                            column_type = (re.search(r"(?:INTEGER|TEXT|REAL|BOOLEAN|DATETIME|DATE|BLOB|UUID)", declaration, re.IGNORECASE) or ["unknown"])[0]
+                            if (column, column_type) not in tables[table]:
+                                tables[table].append((column, column_type))
+                    for column, target_table, _target_column in re.findall(
+                        r"FOREIGN\s+KEY\s*\(\s*(\w+)\s*\)\s*REFERENCES\s+(\w+)\s*\(\s*(\w+)\s*\)",
+                        body, re.IGNORECASE
+                    ):
+                        foreign_keys.add((table, target_table, column))
+                    for column, target_table, _target_column in re.findall(
+                        r"^\s*(\w+)\s+[^\n,]+?REFERENCES\s+(\w+)\s*\(\s*(\w+)\s*\)",
+                        body, re.IGNORECASE | re.MULTILINE
+                    ):
+                        foreign_keys.add((table, target_table, column))
+                for table_match in re.finditer(
+                    r"op\.create_table\(\s*[\"'](\w+)[\"'](?P<body>.*?)(?=\n\s*op\.create_table|\n\s*for column|\n\s*def |\Z)",
+                    content, re.DOTALL
+                ):
+                    table = table_match.group(1)
+                    body = table_match.group("body")
+                    tables.setdefault(table, [])
+                    for column, declaration in re.findall(
+                        r"sa\.Column\(\s*[\"'](\w+)[\"']\s*,\s*([^\n]*)", body
+                    ):
+                        column_type = (re.search(r"(?:String|Integer|Boolean|DateTime|Text|JSON|UUID)", declaration) or ["unknown"])[0]
+                        if (column, column_type) not in tables[table]:
+                            tables[table].append((column, column_type))
+                    for columns, targets in re.findall(
+                        r"sa\.ForeignKeyConstraint\(\s*\[([^\]]+)\]\s*,\s*\[([^\]]+)\]", body
+                    ):
+                        column = re.search(r"[\"'](\w+)[\"']", columns)
+                        target = re.search(r"[\"'](\w+)\.(\w+)[\"']", targets)
+                        if column and target:
+                            foreign_keys.add((table, target.group(1), column.group(1)))
     if not tables:
         return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
                               mermaid='flowchart TD\n    empty["No database schema detected."]',
@@ -156,11 +274,22 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
         for column in node["columns"]:
             mermaid_lines.append(f"        {column['type']} {column['name']}")
         mermaid_lines.append("    }")
+    known_tables = {node["label"] for node in nodes}
+    emitted_relationships: set[tuple[str, str]] = set()
+    for child, parent, _column in sorted(foreign_keys):
+        if child in known_tables and parent in known_tables:
+            relationship = (parent, child)
+            if relationship not in emitted_relationships:
+                mermaid_lines.append(f"    {parent} ||--o{{ {child} : contains")
+                emitted_relationships.add(relationship)
     return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
                           mermaid="\n".join(mermaid_lines),
                           explanation=(f"This diagram shows the database tables detected in the processed source: {', '.join(node['label'] for node in nodes)}. "
                                        "Columns are included when their declarations were available; relationships are shown only when explicitly detected."),
                           nodes=nodes,
+                          edges=[{"source": child, "target": parent, "label": column}
+                                 for child, parent, column in sorted(foreign_keys)
+                                 if child in known_tables and parent in known_tables],
                           notes=["Only schema declarations found in processed source were included."])
 
 

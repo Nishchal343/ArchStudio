@@ -16,6 +16,8 @@ services:
       EMBEDDING_DEVICE: cpu
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
       EMBEDDING_CONCURRENCY: ${EMBEDDING_CONCURRENCY:-2}
+      HF_HOME: /root/.cache/huggingface
+      TOKENIZERS_PARALLELISM: "false"
       N8N_BASE_URL: http://n8n:5678
       N8N_GITHUB_WORKFLOW_WEBHOOK: ${N8N_GITHUB_WORKFLOW_WEBHOOK:-webhook/github-retrieval}
       N8N_CALLBACK_URL: http://backend:8000/api/projects/retrieval/callback
@@ -23,6 +25,7 @@ services:
       - "8000:8000"
     volumes:
       - project_storage:/app/storage/projects
+      - embedding_model_cache:/root/.cache/huggingface
     depends_on:
       n8n:
         condition: service_started
@@ -78,6 +81,7 @@ services:
 volumes:
   n8n_data:
   project_storage:
+  embedding_model_cache:
 
 networks:
   archstudio:

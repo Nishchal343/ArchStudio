@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from app.config import get_settings
 from app.schemas import SearchRequest
 from app.services.embeddings.base import EmbeddingProviderError
+from app.services.embeddings.lightning import LightningEmbeddingProvider
 from app.services.embeddings.sentence_transformers import SentenceTransformerEmbeddingProvider
 from app.services.rag.ingestion import EmbeddingIngestionError, ingest_project
 from app.services.rag.retrieval import search_project
@@ -27,6 +28,26 @@ class FakeModel:
     def encode(self, texts, **kwargs):
         self.calls.append((texts, kwargs))
         return [[0.1] * self.dimension for _ in texts]
+
+
+class FakeHttpResponse:
+    status_code = 200
+
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+
+    def json(self):
+        return {"embeddings": self.embeddings}
+
+
+class FakeHttpClient:
+    def __init__(self, dimension=768):
+        self.dimension = dimension
+        self.calls = []
+
+    async def post(self, url, headers, json):
+        self.calls.append((url, headers, json))
+        return FakeHttpResponse([[0.1] * self.dimension for _ in json["texts"]])
 
 
 def run(coro):
@@ -47,6 +68,22 @@ def test_provider_rejects_dimension_mismatch():
     provider = SentenceTransformerEmbeddingProvider(model=FakeModel(dimension=2), dimension=3, max_retries=0)
     with pytest.raises(EmbeddingProviderError):
         run(provider.embed_documents(["a"]))
+
+
+def test_lightning_provider_returns_768_dimensions_and_preserves_prefixes():
+    client = FakeHttpClient()
+    provider = LightningEmbeddingProvider(
+        url="https://lightning.test", api_key="test-key", client=client,
+        dimension=768, max_retries=0,
+    )
+    vectors = run(provider.embed_documents(["source code"]))
+    query = run(provider.embed_query("find auth"))
+    assert len(vectors) == 1 and len(vectors[0]) == 768
+    assert len(query) == 768
+    assert client.calls[0][0] == "https://lightning.test/embed"
+    assert client.calls[0][1]["Authorization"] == "Bearer test-key"
+    assert client.calls[0][2]["texts"] == ["search_document: source code"]
+    assert client.calls[1][2]["texts"] == ["search_query: find auth"]
 
 
 class FakeStore:

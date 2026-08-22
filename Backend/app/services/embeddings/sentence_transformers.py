@@ -20,6 +20,7 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         self.max_retries = settings.embedding_max_retries if max_retries is None else max_retries
         self._model = model
         self._model_lock = asyncio.Lock()
+        self._query_cache: dict[str, list[float]] = {}
         if not self.model_name:
             raise EmbeddingProviderError("Embedding model configuration is invalid")
         if self.dimension <= 0 or self.batch_size <= 0:
@@ -101,8 +102,17 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         return await self._embed(texts, "search_document: ")
 
     async def embed_query(self, text: str) -> list[float]:
+        cached = self._query_cache.get(text)
+        if cached is not None:
+            return cached.copy()
         vectors = await self._embed([text], "search_query: ")
-        return vectors[0]
+        vector = vectors[0]
+        # Report generation reuses the same section headings across requests.
+        # Keep only a small bounded cache so repeated CPU inference is avoided.
+        if len(self._query_cache) >= 256:
+            self._query_cache.pop(next(iter(self._query_cache)))
+        self._query_cache[text] = vector
+        return vector.copy()
 
     async def health_check(self) -> None:
         await asyncio.to_thread(self._load_model)

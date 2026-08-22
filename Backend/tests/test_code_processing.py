@@ -25,6 +25,7 @@ def test_processing_discovers_filters_redacts_and_chunks(tmp_path, monkeypatch):
     (root / "src" / ".env").write_text("SECRET=ignored", encoding="utf-8")
     (root / "node_modules").mkdir()
     (root / "node_modules" / "ignored.js").write_text("ignored", encoding="utf-8")
+    (root / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
 
     manifest = process_project_files("project-1")
     assert manifest["processed_files"] == 1
@@ -36,6 +37,7 @@ def test_processing_discovers_filters_redacts_and_chunks(tmp_path, monkeypatch):
     assert "do-not-persist" not in chunks
     assert "[REDACTED_SECRET]" in chunks
     assert "project-1" in chunks
+    assert "package-lock.json" not in chunks
 
 
 def test_processing_is_deterministic_for_metadata_and_chunks(tmp_path, monkeypatch):

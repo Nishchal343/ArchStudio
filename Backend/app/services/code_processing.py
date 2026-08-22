@@ -35,6 +35,7 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
 DEFAULT_EXCLUDED_FILE_PATTERNS = {
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.ico", "*.bmp", "*.tiff", "*.mp3",
     "*.mp4", "*.mov", "*.avi", "*.woff", "*.woff2", "*.ttf", "*.otf", "*.map", "*.min.js", "*.min.css",
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock", "Gemfile.lock",
 }
 
 _PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----", re.IGNORECASE)

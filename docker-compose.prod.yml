@@ -1,0 +1,80 @@
+services:
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./Backend/.env
+    environment:
+      PROJECT_STORAGE_ROOT: /app/storage/projects
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      EMBEDDING_CONCURRENCY: ${EMBEDDING_CONCURRENCY:-2}
+      HF_HOME: /root/.cache/huggingface
+      TOKENIZERS_PARALLELISM: "false"
+      N8N_BASE_URL: http://n8n:5678
+      N8N_CALLBACK_URL: http://backend:8000/api/projects/retrieval/callback
+    volumes:
+      - project_storage:/app/storage/projects
+      - embedding_model_cache:/root/.cache/huggingface
+    depends_on:
+      n8n:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [archstudio]
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    networks: [archstudio]
+
+  n8n:
+    image: n8nio/n8n:2.35.3
+    environment:
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY in Backend/.env}
+      N8N_RESTRICT_FILE_ACCESS_TO: /files/projects
+      N8N_WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://n8n:5678}/
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - project_storage:/files/projects
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:5678/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    networks: [archstudio]
+
+volumes:
+  n8n_data:
+  project_storage:
+  embedding_model_cache:
+
+networks:
+  archstudio:
+    driver: bridge
