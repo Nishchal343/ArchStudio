@@ -2,6 +2,17 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
 
 export function getToken() { return localStorage.getItem('archstudio_token'); }
 export function setToken(token) { token ? localStorage.setItem('archstudio_token', token) : localStorage.removeItem('archstudio_token'); }
+export function getRefreshToken() { return localStorage.getItem('archstudio_refresh_token'); }
+export function setSession(session) {
+  if (!session?.access_token) {
+    setToken(null);
+    localStorage.removeItem('archstudio_refresh_token');
+    return;
+  }
+  setToken(session.access_token);
+  if (session.refresh_token) localStorage.setItem('archstudio_refresh_token', session.refresh_token);
+  else localStorage.removeItem('archstudio_refresh_token');
+}
 
 async function request(path, options = {}) {
   const headers = { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(options.headers || {}) };
@@ -21,8 +32,10 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  login: (data) => request('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
-  register: (data) => request('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
+  login: async (data) => { const result = await request('/auth/login', { method: 'POST', body: JSON.stringify(data) }); setSession(result.session); return result; },
+  register: async (data) => { const result = await request('/auth/register', { method: 'POST', body: JSON.stringify(data) }); setSession(result.session); return result; },
+  oauthCallback: (code) => request('/auth/callback', { method: 'POST', body: JSON.stringify({ code }) }),
+  refresh: (refresh_token) => request('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh_token }) }),
   forgotPassword: (data) => request('/auth/forgot-password', { method: 'POST', body: JSON.stringify(data) }),
   updatePassword: (data) => request('/auth/update-password', { method: 'POST', body: JSON.stringify(data) }),
   oauth: (provider) => request(`/auth/oauth/${provider}`),

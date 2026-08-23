@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import mermaid from 'mermaid';
-import { api, getToken, setToken } from './api';
+import { api, getRefreshToken, getToken, setSession, setToken } from './api';
 import LiteratureReview from './LiteratureReview';
 
 const statuses = { embedded: 'Ready', embedding: 'AI processing — please wait', processed: 'Processed', processing: 'AI processing — please wait', ready: 'Ready to process', failed: 'Failed', created: 'Created', validating: 'Validating' };
@@ -31,8 +31,26 @@ function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('archstudio_theme', theme); }, [theme]);
-  useEffect(() => { const token = getToken(); if (token) api.me().then(setUser).catch(() => setUser(null)).finally(() => setAuthReady(true)); else setAuthReady(true); const expire = () => setUser(null); window.addEventListener('auth-expired', expire); return () => window.removeEventListener('auth-expired', expire); }, []);
-  const logout = () => { setToken(null); setUser(null); };
+  useEffect(() => {
+    const token = getToken();
+    const restore = async () => {
+      if (!token) return;
+      try {
+        setUser(await api.me());
+      } catch {
+        const refreshToken = getRefreshToken();
+        if (!refreshToken) throw new Error('No refresh session');
+        const result = await api.refresh(refreshToken);
+        setSession(result.session);
+        setUser(result.user);
+      }
+    };
+    restore().catch(() => { setSession(null); setUser(null); }).finally(() => setAuthReady(true));
+    const expire = () => setUser(null);
+    window.addEventListener('auth-expired', expire);
+    return () => window.removeEventListener('auth-expired', expire);
+  }, []);
+  const logout = () => { setSession(null); setUser(null); };
   if (!authReady) return <div className="auth-layout"><div className="auth-panel"><LoadingCard /></div></div>;
   return <Routes>
     <Route path="/login" element={user ? <Navigate to="/" /> : <AuthPageV3 mode="login" onAuth={setUser} />} />
@@ -59,13 +77,19 @@ function AuthCallback({ onAuth }) {
   const navigate = useNavigate();
   const [error, setError] = useState('');
   useEffect(() => {
-    const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-    const token = params.get('access_token');
-    const authError = params.get('error_description') || new URLSearchParams(window.location.search).get('error_description');
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const searchParams = new URLSearchParams(window.location.search);
+    const token = hashParams.get('access_token');
+    const code = searchParams.get('code');
+    const authError = hashParams.get('error_description') || searchParams.get('error_description');
     if (authError) { setError('Authentication was cancelled or could not be completed.'); return; }
-    if (!token) { setError('Authentication callback was invalid.'); return; }
-    setToken(token);
-    api.me().then(user => { onAuth(user); navigate('/'); }).catch(() => { setToken(null); setError('Authentication could not be completed. Please try again.'); });
+    const complete = token ? Promise.resolve({ session: { access_token: token }, user: null }) : code ? api.oauthCallback(code) : Promise.reject(new Error('Missing callback credentials'));
+    complete.then(async result => {
+      if (result.session) setSession(result.session);
+      const user = result.user || await api.me();
+      onAuth(user);
+      navigate('/');
+    }).catch(() => { setSession(null); setError(code ? 'Authentication could not be completed. Please try again.' : 'Authentication callback was invalid.'); });
   }, [navigate, onAuth]);
   return <div className="auth-layout"><div className="auth-panel auth-callback"><div className="auth-form"><div className="eyebrow">AUTHENTICATION</div><h2>{error ? 'Sign-in failed' : 'Completing sign-in…'}</h2>{error && <><p className="muted">{error}</p><Link className="primary-button wide" to="/login">Return to sign in</Link></>}</div></div></div>;
 }
@@ -108,7 +132,7 @@ function AuthPageV3({ mode, onAuth }) { const navigate = useNavigate(); const [f
 
 function ResetPassword() {
   const navigate = useNavigate(); const [form, setForm] = useState({ password: '', confirm_password: '' }); const [busy, setBusy] = useState(false); const [state, setState] = useState('ready'); const [error, setError] = useState('');
-  useEffect(() => { const params = new URLSearchParams(window.location.hash.replace(/^#/, '')); const token = params.get('access_token'); if (!token) { setState('invalid'); setError(params.get('error_description') || 'This password reset link is invalid or expired.'); } else setToken(token); }, []);
+  useEffect(() => { const params = new URLSearchParams(window.location.hash.replace(/^#/, '')); const token = params.get('access_token'); if (!token) { setState('invalid'); setError(params.get('error_description') || 'This password reset link is invalid or expired.'); } else setSession({ access_token: token }); }, []);
   const submit = async (e) => { e.preventDefault(); setBusy(true); setError(''); try { await api.updatePassword(form); setToken(null); navigate('/register'); } catch (err) { setError(err.message || 'Password could not be updated.'); } finally { setBusy(false); } };
   return <div className="auth-layout centered-auth"><div className="auth-panel"><div className="auth-form"><div className="eyebrow">PASSWORD RECOVERY</div>{state === 'success' ? <><h2>Password changed</h2><p className="muted">Your password has been updated successfully.</p><button className="primary-button wide" onClick={() => navigate('/register')}>Continue to registration</button></> : state === 'invalid' ? <><h2>Reset link unavailable</h2><p className="muted">{error}</p><Link className="primary-button wide" to="/login">Return to sign in</Link></> : <><h2>Choose a new password</h2><p className="muted">Use at least 8 characters. After changing it, you’ll return to registration.</p><form onSubmit={submit}><PasswordField label="New password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /><PasswordField label="Confirm new password" value={form.confirm_password} onChange={e => setForm({ ...form, confirm_password: e.target.value })} />{error && <div className="error-box">{error}</div>}<button className="primary-button wide" disabled={busy}>{busy ? 'Updating…' : 'Change password'}</button></form></>}</div></div></div>;
 }

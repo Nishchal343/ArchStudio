@@ -6,7 +6,15 @@ from supabase_auth.errors import AuthApiError
 
 from ..config import get_settings
 from ..auth_errors import auth_error
-from ..schemas import AuthResponse, EmailRequest, LoginRequest, RegisterRequest, UpdatePasswordRequest
+from ..schemas import (
+    AuthResponse,
+    EmailRequest,
+    LoginRequest,
+    OAuthCallbackRequest,
+    RefreshSessionRequest,
+    RegisterRequest,
+    UpdatePasswordRequest,
+)
 from ..supabase_client import get_supabase
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -69,6 +77,27 @@ def register(payload: RegisterRequest):
 def login(payload: LoginRequest):
     try:
         result = get_supabase().auth.sign_in_with_password({"email": str(payload.email), "password": payload.password})
+        return auth_response(result)
+    except AuthApiError as error:
+        raise auth_error(error)
+
+
+@router.post("/callback", response_model=AuthResponse)
+def oauth_callback(payload: OAuthCallbackRequest):
+    """Exchange Supabase's authorization code using the client PKCE verifier."""
+    try:
+        result = get_supabase().auth.exchange_code_for_session(
+            {"auth_code": payload.code, "redirect_to": get_settings().auth_redirect_url}
+        )
+        return auth_response(result)
+    except AuthApiError as error:
+        raise auth_error(error)
+
+
+@router.post("/refresh", response_model=AuthResponse)
+def refresh_session(payload: RefreshSessionRequest):
+    try:
+        result = get_supabase().auth.refresh_session(payload.refresh_token)
         return auth_response(result)
     except AuthApiError as error:
         raise auth_error(error)

@@ -36,6 +36,14 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class OAuthCallbackRequest(BaseModel):
+    code: str = Field(min_length=1)
+
+
+class RefreshSessionRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
 class UpdatePasswordRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     confirm_password: str
