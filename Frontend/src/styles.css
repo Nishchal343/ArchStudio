@@ -107,6 +107,7 @@ body { -webkit-font-smoothing:antialiased; }
 .oauth-button { width:100%; justify-content:flex-start; margin-bottom:9px; }
 .oauth-button strong { width:20px; text-align:center; font-family:'Space Grotesk'; color:var(--accent); }
 .oauth-options { display:grid; gap:0; }
+.oauth-options .oauth-button:first-child { display:none; }
 .forgot-password { display:block; margin-top:-7px; color:var(--accent); font-size:12px; text-align:right; }
 .ready-estimate { margin-top:15px; color:var(--accent); font-size:13px; }
 .ready-estimate strong { font-family:'Space Grotesk'; }
