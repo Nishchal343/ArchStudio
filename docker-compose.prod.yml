@@ -37,12 +37,16 @@ services:
         VITE_API_URL: /api
     ports:
       - "80:80"
+      - "443:443"
+    volumes:
+      - ./certbot-webroot:/var/www/certbot:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/"]
+      test: ["CMD", "wget", "--no-check-certificate", "--spider", "--quiet", "https://127.0.0.1/"]
       interval: 15s
       timeout: 5s
       retries: 6
