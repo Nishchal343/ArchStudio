@@ -30,18 +30,69 @@ def mermaid_from_graph(nodes: list[dict], edges: list[dict]) -> str:
 
 
 def _architecture_explanation(nodes: list[dict], edges: list[dict]) -> str:
-    sources = [node["label"] for node in nodes if node.get("kind") not in {"output", "note"}]
-    if not sources:
+    visible = [node for node in nodes if node.get("kind") not in {"output", "note"}]
+    if not visible:
         return "No architecture relationships were supported by the indexed repository evidence."
-    labels = {node["id"]: node["label"] for node in nodes}
-    relationships = "; ".join(
-        f"{labels.get(edge['source'], edge['source'])} {edge.get('label', 'connects to')} "
-        f"{labels.get(edge['target'], edge['target'])}" for edge in edges
-    ) or "No explicit relationships were detected in the retrieved source snippets."
-    return ("This diagram summarizes the repository components identified from the processed source files. "
-            f"The source files represented are {', '.join(sources)}. "
-            f"The detected relationships are: {relationships}. "
-            "Relationships are included only when supported by file paths or source references; this is not a complete runtime trace.")
+
+    source_nodes = [node for node in visible if node.get("kind") == "source"]
+    capabilities = [node["label"] for node in visible if node.get("kind") == "capability"]
+    runtimes = [node["label"] for node in visible if node.get("kind") == "runtime"]
+
+    def names(items: list[str], limit: int = 6) -> str:
+        shown = items[:limit]
+        suffix = f" and {len(items) - limit} more" if len(items) > limit else ""
+        return ", ".join(shown) + suffix
+
+    groups: dict[str, list[str]] = {
+        "entry points and configuration": [],
+        "application logic": [],
+        "data and persistence": [],
+        "presentation and routing": [],
+        "other supporting components": [],
+    }
+    for node in source_nodes:
+        path = node["label"]
+        lower = path.lower()
+        if any(token in lower for token in ("settings", "config", "manage.py", "main.py", "app.py", "application")):
+            group = "entry points and configuration"
+        elif any(token in lower for token in ("model", "migration", "schema", "database", "repository", "persistence")):
+            group = "data and persistence"
+        elif any(token in lower for token in ("template", "html", "component", "page", "view", "url", "route")):
+            group = "presentation and routing"
+        elif any(token in lower for token in ("service", "controller", "worker", "pipeline", "signal", "form")):
+            group = "application logic"
+        else:
+            group = "other supporting components"
+        groups[group].append(path)
+
+    sections = [
+        "This is a static architecture map of the repository, built from indexed source files and dependency signals. "
+        "It is best read as a map of responsibility and dependency direction, not as a chronological execution trace.",
+    ]
+    for title, items in groups.items():
+        if items:
+            sections.append(f"{title.capitalize()}: {names(items)}.")
+    if capabilities:
+        sections.append(f"Detected capabilities: {names(capabilities)}. These capabilities are linked to the source files that appear to provide them.")
+    if runtimes:
+        sections.append(f"Runtime orchestration: {names(runtimes)}. These nodes indicate where the application is packaged or coordinated.")
+
+    imports = [edge for edge in edges if edge.get("label") == "imports"]
+    provides = [edge for edge in edges if edge.get("label") == "provides"]
+    orchestrates = [edge for edge in edges if edge.get("label") == "orchestrates"]
+    flow_parts = []
+    if imports:
+        flow_parts.append(f"{len(imports)} import dependencies connect modules")
+    if provides:
+        flow_parts.append(f"{len(provides)} capability links connect implementation files to detected features")
+    if orchestrates:
+        flow_parts.append(f"{len(orchestrates)} runtime links connect containers or launchers to application code")
+    if flow_parts:
+        sections.append("The arrows show that " + "; ".join(flow_parts) + ". Follow an arrow from its source to see which component depends on or provides the target.")
+    else:
+        sections.append("No explicit dependency arrows were detected in the indexed source evidence.")
+    sections.append("Only relationships supported by file paths or source references are shown; external services, indirect calls, and runtime behavior may not appear.")
+    return " ".join(sections)
 
 
 async def enrich_diagram_explanation(payload: DiagramPayload) -> DiagramPayload:
@@ -50,7 +101,7 @@ async def enrich_diagram_explanation(payload: DiagramPayload) -> DiagramPayload:
     prompt = f"""Explain this {payload.diagram_type.value} diagram for a developer.
 Return JSON only: {{"explanation": "..."}}.
 
-Explain every box/node: what it represents and what role it plays. Explain every arrow: what moves or depends on what, and in which direction. Then describe the complete flow from input or entry point to the final application output. For a database schema, explain every table and its columns, how records would be written/read through the application, and explain relationships only when they are explicitly present in the supplied graph. Use only the supplied diagram structure. Do not invent functions, business rules, database relationships, or runtime behavior that the graph does not establish. If a role cannot be determined from a file name or node kind, say that clearly. Write several useful paragraphs, not a generic disclaimer.
+Write a useful architecture walkthrough, not a catalogue of filenames. Start with the purpose of the diagram and its limitations. Group nodes by responsibility (entry/configuration, application logic, data/persistence, presentation/routing, capabilities, and runtime). For each group, name the most important components and explain their likely role from the node label and kind. Explain the arrow types: imports mean dependency direction, provides means a file supports a detected capability, and orchestrates means a runtime/container coordinates code. Describe the most plausible high-level flow only when the graph supports it. For a database schema, explain tables and columns and describe relationships only when explicitly present. Use only the supplied diagram structure; do not invent functions, business rules, database relationships, or runtime behavior. If a role cannot be determined, say so briefly. Return 2-4 concise paragraphs with concrete details, not a generic disclaimer.
 
 DIAGRAM STRUCTURE:
 {graph}
@@ -172,6 +223,45 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
     path = project_directory(str(project_id)) / "processed" / "chunks" / "chunks.jsonl"
     tables: dict[str, list[tuple[str, str]]] = {}
     foreign_keys: set[tuple[str, str, str]] = set()
+    django_models: dict[str, str] = {}
+    django_foreign_keys: list[tuple[str, str, str]] = []
+
+    def django_type(field_type: str) -> str:
+        return {
+            "AutoField": "INTEGER",
+            "BigAutoField": "INTEGER",
+            "IntegerField": "INTEGER",
+            "PositiveIntegerField": "INTEGER",
+            "DecimalField": "DECIMAL",
+            "FloatField": "REAL",
+            "BooleanField": "BOOLEAN",
+            "DateField": "DATE",
+            "DateTimeField": "DATETIME",
+            "JSONField": "JSON",
+            "TextField": "TEXT",
+            "EmailField": "TEXT",
+            "URLField": "TEXT",
+            "CharField": "VARCHAR",
+        }.get(field_type, "TEXT")
+
+    def add_django_model(model_name: str, body: str) -> None:
+        meta = re.search(r"class\s+Meta\s*:.*?db_table\s*=\s*[\"']([^\"']+)", body, re.DOTALL)
+        table_name = meta.group(1) if meta else re.sub(r"(?<!^)(?=[A-Z])", "_", model_name).lower()
+        django_models[model_name.lower()] = table_name
+        tables.setdefault(table_name, [])
+        field_pattern = re.compile(
+            r"^\s{4}(\w+)\s*=\s*models\.(\w+)\((.*?)(?=^\s{4}\w+\s*=\s*models\.|^\s{4}class\s|\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+        for column, field_type, declaration in field_pattern.findall(body):
+            if field_type == "ForeignKey":
+                target = re.search(r"models\.ForeignKey\(\s*([A-Za-z_]\w*)", declaration)
+                if target:
+                    django_foreign_keys.append((table_name, target.group(1).lower(), column))
+            column_type = django_type(field_type)
+            if (column, column_type) not in tables[table_name]:
+                tables[table_name].append((column, column_type))
+
     if path.is_file():
         with path.open("r", encoding="utf-8") as source:
             for line in source:
@@ -181,6 +271,12 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                     continue
                 for table in re.findall(r"__tablename__\s*=\s*[\"']([^\"']+)", content):
                     tables.setdefault(table, [])
+                for model_match in re.finditer(
+                    r"class\s+(\w+)\s*\(\s*models\.Model\s*\)\s*:(.*?)(?=^class\s+\w+\s*\(|\Z)",
+                    content,
+                    re.DOTALL | re.MULTILINE,
+                ):
+                    add_django_model(model_match.group(1), model_match.group(2))
                 for class_match in re.finditer(
                     r"__tablename__\s*=\s*[\"']([^\"']+)[\"'](?P<body>.*?)(?=\nclass |\Z)", content, re.DOTALL
                 ):
@@ -260,6 +356,36 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                         target = re.search(r"[\"'](\w+)\.(\w+)[\"']", targets)
                         if column and target:
                             foreign_keys.add((table, target.group(1), column.group(1)))
+                # Django migrations provide a second source of schema evidence.
+                for migration_match in re.finditer(
+                    r"migrations\.CreateModel\(\s*name\s*=\s*[\"'](\w+)[\"'](?P<body>.*?)(?=\n\s*migrations\.(?:CreateModel|AddField|AlterField|DeleteModel)|\n\s*\])",
+                    content,
+                    re.DOTALL,
+                ):
+                    model_name = migration_match.group(1)
+                    body = migration_match.group("body")
+                    table_match = re.search(r"[\"']db_table[\"']\s*:\s*[\"']([^\"']+)", body)
+                    table_name = table_match.group(1) if table_match else re.sub(r"(?<!^)(?=[A-Z])", "_", model_name).lower()
+                    django_models[model_name.lower()] = table_name
+                    tables.setdefault(table_name, [])
+                    for field_match in re.finditer(
+                        r"\(\s*[\"'](\w+)[\"']\s*,\s*models\.(\w+)\((.*?)(?=\n\s*\(\s*[\"']\w+[\"']\s*,|\n\s*\]\s*)",
+                        body,
+                        re.DOTALL,
+                    ):
+                        column, field_type, declaration = field_match.groups()
+                        column_type = django_type(field_type)
+                        if (column, column_type) not in tables[table_name]:
+                            tables[table_name].append((column, column_type))
+                        if field_type == "ForeignKey":
+                            target = re.search(r"to\s*=\s*[\"'](?:\w+\.)?(\w+)[\"']", declaration)
+                            if target:
+                                django_foreign_keys.append((table_name, target.group(1).lower(), column))
+
+    for child_table, target_model, column in django_foreign_keys:
+        parent_table = django_models.get(target_model, target_model)
+        if child_table in tables and parent_table in tables:
+            foreign_keys.add((child_table, parent_table, column))
     if not tables:
         return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
                               mermaid='flowchart TD\n    empty["No database schema detected."]',
