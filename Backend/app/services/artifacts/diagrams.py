@@ -408,12 +408,13 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
             if relationship not in emitted_relationships:
                 mermaid_lines.append(f"    {parent} ||--o{{ {child} : contains")
                 emitted_relationships.add(relationship)
+    table_ids = {node["label"]: node["id"] for node in nodes}
     return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
                           mermaid="\n".join(mermaid_lines),
                           explanation=(f"This diagram shows the database tables detected in the processed source: {', '.join(node['label'] for node in nodes)}. "
                                        "Columns are included when their declarations were available; relationships are shown only when explicitly detected."),
                           nodes=nodes,
-                          edges=[{"source": child, "target": parent, "label": column}
+                          edges=[{"source": table_ids[child], "target": table_ids[parent], "label": column}
                                  for child, parent, column in sorted(foreign_keys)
                                  if child in known_tables and parent in known_tables],
                           notes=["Only schema declarations found in processed source were included."])
@@ -424,10 +425,17 @@ def render_diagram(payload: DiagramPayload, output_format: str) -> tuple[bytes, 
         node["id"]: (40 + (index % 3) * 290, 40 + (index // 3) * 100)
         for index, node in enumerate(payload.nodes)
     }
+    endpoint_ids = {node["label"]: node["id"] for node in payload.nodes}
+
+    def position_for(endpoint: str):
+        node_id = endpoint if endpoint in positions else endpoint_ids.get(endpoint)
+        if node_id not in positions:
+            raise ValueError(f"Diagram edge references unknown node: {endpoint}")
+        return positions[node_id]
 
     def edge_points(edge):
-        x1, y1 = positions[edge["source"]]
-        x2, y2 = positions[edge["target"]]
+        x1, y1 = position_for(edge["source"])
+        x2, y2 = position_for(edge["target"])
         return x1 + 110, y1 + 50, x2 + 110, y2
 
     if output_format == "svg":
