@@ -616,9 +616,13 @@ async def retrieve_github_project(project_id: UUID, current_user: dict = Depends
 
     project.status = ProjectStatus.QUEUED
     project.status_message = "Repository retrieval queued."
-    project.storage_path = project.storage_path or str(project_directory(str(project.id)))
-    await db.commit()
 
+    source_directory = project_directory(str(project.id))
+    source_directory.mkdir(parents=True, exist_ok=True)
+
+    project.storage_path = project.storage_path or str(source_directory)
+
+    await db.commit()
     request = RetrievalRequest(
         project_id=str(project.id),
         user_id=str(project.user_id),
