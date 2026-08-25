@@ -53,12 +53,12 @@ function App() {
   const logout = () => { setSession(null); setUser(null); };
   if (!authReady) return <div className="auth-layout"><div className="auth-panel"><LoadingCard /></div></div>;
   return <Routes>
-    <Route path="/login" element={user ? <Navigate to="/" /> : <AuthPageV3 mode="login" onAuth={setUser} />} />
+    <Route path="/login" element={user ? <Navigate to="/" /> : <><AuthSuccessNotice /><AuthPageV3 mode="login" onAuth={setUser} /></>} />
     <Route path="/register" element={user ? <Navigate to="/" /> : <AuthPageV3 mode="register" onAuth={setUser} />} />
     <Route path="/auth/callback" element={<AuthCallback onAuth={setUser} />} />
     <Route path="/auth/confirm" element={<AuthConfirmation onAuth={setUser} />} />
     <Route path="/forgot-password" element={<ForgotPassword />} />
-    <Route path="/auth/reset-password" element={<ResetPassword />} />
+    <Route path="/auth/reset-password" element={<ResetPasswordFlow />} />
     <Route path="*" element={user ? <SessionRouter user={user} logout={logout} theme={theme} setTheme={setTheme} /> : <Navigate to="/login" replace />} />
   </Routes>;
 }
@@ -72,6 +72,12 @@ function Shell({ user, logout, theme, setTheme }) {
   return <div className="app-shell"><main className="main"><header className="topbar"><Link className="header-brand" to="/"><span className="brand-mark">A</span><span>ArchStudio<span className="accent">AI</span></span></Link><div className="header-context">{inProject ? <><span>Project Workspace</span><b>/</b><strong>{projectContext?.name || 'Loading project…'}</strong></> : <><span>Engineering intelligence</span><b>·</b><Link to="/">Dashboard</Link></>}</div><div className="topbar-right"><span className="status-dot">●</span><span className="workspace-label">Local AI workspace</span><button className="header-control" onClick={() => setTheme(theme === 'batman' ? 'superman' : 'batman')} title="Switch theme">{theme === 'batman' ? '☾' : '☀'}<span className="control-label">{theme === 'batman' ? 'Batman dark' : 'Superman light'}</span></button><span className="topbar-divider" /><details className="profile-menu"><summary><span className="avatar small">{(user.email || 'A')[0].toUpperCase()}</span><span className="profile-name">{user.user_metadata?.name || user.email?.split('@')[0]}</span><span>⌄</span></summary><div className="profile-dropdown"><span className="muted">{user.email}</span><Link to="/">Dashboard</Link><button onClick={logout}>Log out</button></div></details></div></header><div className="content"><Routes><Route path="/" element={<Dashboard />} /><Route path="/projects" element={<Navigate to="/" replace />} /><Route path="/projects/:id" element={<Workspace />} /><Route path="/projects/:id/reports" element={<ArtifactLibrary kind="reports" />} /><Route path="/projects/:id/diagrams" element={<ArtifactLibrary kind="diagrams" />} /><Route path="/projects/:id/research" element={<ArtifactLibrary kind="research" />} /><Route path="/projects/:id/chat" element={<GlobalChat />} /><Route path="/reports" element={<ArtifactLibrary kind="reports" />} /><Route path="/diagrams" element={<ArtifactLibrary kind="diagrams" />} /><Route path="/research" element={<ArtifactLibrary kind="research" />} /><Route path="/chat" element={<GlobalChat />} /><Route path="*" element={<Navigate to="/" />} /></Routes></div></main></div>;
 }
 function NavItem({ to, icon, children }) { return <NavLink className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'} to={to}><span>{icon}</span>{children}</NavLink>; }
+
+function AuthSuccessNotice() {
+  const [message, setMessage] = useState(() => sessionStorage.getItem('archstudio_auth_success') || '');
+  useEffect(() => { if (message) sessionStorage.removeItem('archstudio_auth_success'); }, [message]);
+  return message ? <div className="auth-success-notice notice-box" role="status">{message}</div> : null;
+}
 
 function AuthCallback({ onAuth }) {
   const navigate = useNavigate();
@@ -104,12 +110,16 @@ function AuthConfirmation({ onAuth }) {
       const accessToken = hash.get('access_token');
       const error = hash.get('error_description') || new URLSearchParams(window.location.search).get('error_description');
       if (error) { if (live) setState('failed'); return; }
-      if (accessToken) setToken(accessToken);
+      if (accessToken) setSession({ access_token: accessToken, refresh_token: hash.get('refresh_token') });
       try {
         const currentUser = await api.me();
         const verified = Boolean(currentUser.email_confirmed || currentUser.email_confirmed_at || currentUser.confirmed_at || currentUser.email_verified);
         if (!verified) throw new Error('Email verification is not complete.');
-        if (live) { onAuth(currentUser); setState('success'); }
+        if (live) {
+          setSession(null);
+          sessionStorage.setItem('archstudio_auth_success', 'Login successful. You can now continue.');
+          navigate('/login', { replace: true });
+        }
       } catch {
         if (live) setState('failed');
       }
@@ -135,6 +145,41 @@ function ResetPassword() {
   useEffect(() => { const params = new URLSearchParams(window.location.hash.replace(/^#/, '')); const token = params.get('access_token'); if (!token) { setState('invalid'); setError(params.get('error_description') || 'This password reset link is invalid or expired.'); } else setSession({ access_token: token }); }, []);
   const submit = async (e) => { e.preventDefault(); setBusy(true); setError(''); try { await api.updatePassword(form); setToken(null); navigate('/register'); } catch (err) { setError(err.message || 'Password could not be updated.'); } finally { setBusy(false); } };
   return <div className="auth-layout centered-auth"><div className="auth-panel"><div className="auth-form"><div className="eyebrow">PASSWORD RECOVERY</div>{state === 'success' ? <><h2>Password changed</h2><p className="muted">Your password has been updated successfully.</p><button className="primary-button wide" onClick={() => navigate('/register')}>Continue to registration</button></> : state === 'invalid' ? <><h2>Reset link unavailable</h2><p className="muted">{error}</p><Link className="primary-button wide" to="/login">Return to sign in</Link></> : <><h2>Choose a new password</h2><p className="muted">Use at least 8 characters. After changing it, you’ll return to registration.</p><form onSubmit={submit}><PasswordField label="New password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /><PasswordField label="Confirm new password" value={form.confirm_password} onChange={e => setForm({ ...form, confirm_password: e.target.value })} />{error && <div className="error-box">{error}</div>}<button className="primary-button wide" disabled={busy}>{busy ? 'Updating…' : 'Change password'}</button></form></>}</div></div></div>;
+}
+
+function ResetPasswordFlow() {
+  const navigate = useNavigate();
+  const [form, setForm] = useState({ password: '', confirm_password: '' });
+  const [busy, setBusy] = useState(false);
+  const [invalid, setInvalid] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const query = new URLSearchParams(window.location.search);
+    const token = hash.get('access_token') || query.get('access_token');
+    const refreshToken = hash.get('refresh_token') || query.get('refresh_token');
+    const linkError = hash.get('error_description') || query.get('error_description');
+    if (!token || linkError) {
+      setInvalid(true);
+      setError(linkError || 'This password reset link is invalid or expired.');
+      return;
+    }
+    setSession({ access_token: token, refresh_token: refreshToken });
+  }, []);
+  const submit = async e => {
+    e.preventDefault();
+    if (form.password !== form.confirm_password) { setError('Passwords do not match.'); return; }
+    setBusy(true); setError('');
+    try {
+      await api.updatePassword(form);
+      setSession(null);
+      sessionStorage.setItem('archstudio_auth_success', 'Password reset successful. You can now log in.');
+      navigate('/login', { replace: true });
+    } catch (err) {
+      setError(err.message || 'Password could not be updated.');
+    } finally { setBusy(false); }
+  };
+  return <div className="auth-layout centered-auth"><div className="auth-panel"><div className="auth-form"><div className="eyebrow">PASSWORD RECOVERY</div><h2>Reset Password</h2>{invalid ? <><p className="muted">{error}</p><Link className="primary-button wide" to="/login">Return to sign in</Link></> : <><p className="muted">Choose a new password with at least 8 characters.</p><form onSubmit={submit}><PasswordField label="New Password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /><PasswordField label="Confirm Password" value={form.confirm_password} onChange={e => setForm({ ...form, confirm_password: e.target.value })} />{error && <div className="error-box">{error}</div>}<button className="primary-button wide" disabled={busy}>{busy ? 'Resetting…' : 'Reset Password'}</button></form></>}</div></div></div>;
 }
 
 function AuthPageV2({ mode, onAuth }) {

@@ -113,6 +113,7 @@ body { -webkit-font-smoothing:antialiased; }
 .ready-estimate strong { font-family:'Space Grotesk'; }
 .centered-auth { display:grid; grid-template-columns:1fr; }
 .centered-auth .auth-panel { width:min(560px,100%); margin:auto; }
+.auth-success-notice { position:fixed; top:24px; right:24px; z-index:10; max-width:min(390px,calc(100% - 48px)); margin:0; }
 .password-input-wrap { position:relative; display:block; }
 .password-input-wrap input { padding-right:44px; }
 .password-toggle { position:absolute; right:10px; top:50%; transform:translateY(-50%); border:0; background:transparent; color:var(--muted); cursor:pointer; font-size:17px; padding:4px; }
