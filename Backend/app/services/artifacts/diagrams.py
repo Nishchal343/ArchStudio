@@ -249,6 +249,18 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
         table_name = meta.group(1) if meta else re.sub(r"(?<!^)(?=[A-Z])", "_", model_name).lower()
         django_models[model_name.lower()] = table_name
         tables.setdefault(table_name, [])
+
+        # Keep FK discovery independent from the broad field parser below.
+        # Model declarations commonly span several lines, and a chunk boundary
+        # or an additional field option should not turn a real relationship into
+        # an isolated table in the generated diagram.
+        for column, target_model in re.findall(
+            r"^\s{4}(\w+)\s*=\s*models\.ForeignKey\(\s*([A-Za-z_]\w*)",
+            body,
+            re.MULTILINE,
+        ):
+            django_foreign_keys.append((table_name, target_model.lower(), column))
+
         field_pattern = re.compile(
             r"^\s{4}(\w+)\s*=\s*models\.(\w+)\((.*?)(?=^\s{4}\w+\s*=\s*models\.|^\s{4}class\s|\Z)",
             re.MULTILINE | re.DOTALL,
@@ -258,7 +270,11 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                 target = re.search(r"models\.ForeignKey\(\s*([A-Za-z_]\w*)", declaration)
                 if target:
                     django_foreign_keys.append((table_name, target.group(1).lower(), column))
-            column_type = django_type(field_type)
+            # Django stores a ForeignKey as the target model's integer primary
+            # key (the database column is normally named ``<field>_id``).
+            # Rendering it as TEXT makes the relationship easy to miss in an
+            # ER diagram, even though the model declaration is explicit.
+            column_type = "INTEGER" if field_type == "ForeignKey" else django_type(field_type)
             if (column, column_type) not in tables[table_name]:
                 tables[table_name].append((column, column_type))
 
@@ -374,7 +390,7 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                         re.DOTALL,
                     ):
                         column, field_type, declaration = field_match.groups()
-                        column_type = django_type(field_type)
+                        column_type = "INTEGER" if field_type == "ForeignKey" else django_type(field_type)
                         if (column, column_type) not in tables[table_name]:
                             tables[table_name].append((column, column_type))
                         if field_type == "ForeignKey":
@@ -434,9 +450,15 @@ def render_diagram(payload: DiagramPayload, output_format: str) -> tuple[bytes, 
         return positions[node_id]
 
     def edge_points(edge):
-        x1, y1 = position_for(edge["source"])
-        x2, y2 = position_for(edge["target"])
-        return x1 + 110, y1 + 50, x2 + 110, y2
+        """Clip connectors to node boundaries so they never run through boxes."""
+        sx, sy = position_for(edge["source"])
+        tx, ty = position_for(edge["target"])
+        sx, sy, tx, ty = sx + 110, sy + 25, tx + 110, ty + 25
+        dx, dy = tx - sx, ty - sy
+        if dx == 0 and dy == 0:
+            return sx, sy, tx, ty
+        scale = min(110 / abs(dx) if dx else float("inf"), 25 / abs(dy) if dy else float("inf"))
+        return sx + dx * scale, sy + dy * scale, tx - dx * scale, ty - dy * scale
 
     if output_format == "svg":
         width, height = 900, max(180, 100 + len(payload.nodes) * 70)
@@ -449,9 +471,10 @@ def render_diagram(payload: DiagramPayload, output_format: str) -> tuple[bytes, 
         for edge in payload.edges:
             x1, y1, x2, y2 = edge_points(edge)
             label = _svg_escape(str(edge.get("label", "")))
-            parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" marker-end="url(#arrow)"/>')
+            parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" marker-end="url(#arrow)"/>')
             if label:
-                parts.append(f'<text x="{(x1 + x2) / 2}" y="{(y1 + y2) / 2 - 4}" text-anchor="middle">{label}</text>')
+                lx, ly = (x1 + x2) / 2, (y1 + y2) / 2 - 4
+                parts.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" paint-order="stroke" stroke="white" stroke-width="5">{label}</text>')
         parts.append("</svg>")
         return "".join(parts).encode(), "image/svg+xml", "svg"
     if output_format == "png":
