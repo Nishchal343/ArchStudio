@@ -72,6 +72,26 @@ def _prose(value, subject: str = "The project") -> str:
     return str(value or "Evidence unavailable.")
 
 
+def _bounded_prompt_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " [additional detail omitted from prompt]"
+
+
+def _analysis_prompt_payload(analysis: AnalysisResult) -> dict:
+    """Keep the single report request below provider token limits."""
+    payload = analysis.model_dump(mode="json")
+    for key, value in list(payload.items()):
+        if isinstance(value, str):
+            payload[key] = _bounded_prompt_text(value, 2800)
+        elif isinstance(value, list):
+            # The complete analysis remains available to the fallback report;
+            # the LLM only needs representative structured findings.
+            payload[key] = value[:6]
+    return payload
+
+
 _USER_INPUT_HEADING_KEYS = {heading.lower() for heading in USER_INPUT_SECTIONS}
 
 
@@ -260,12 +280,15 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
 
     async def retrieve_for_heading(heading: str) -> tuple[str, str]:
         async with SessionLocal() as section_db:
-            results = await search_project(section_db, project_id, heading, top_k=8,
+            results = await search_project(section_db, project_id, heading, top_k=2,
                                            min_similarity=settings.analysis_min_similarity)
-        context = "\n\n".join(
-            f"FILE: {r['file_path']}:{r.get('start_line')}-{r.get('end_line')}\n{r['content']}"
-            for r in results
-        )
+        evidence = []
+        for result in results[:2]:
+            content = _bounded_prompt_text(result.get("content", ""), 900)
+            evidence.append(
+                f"FILE: {result['file_path']}:{result.get('start_line')}-{result.get('end_line')}\n{content}"
+            )
+        context = "\n\n".join(evidence)
         return heading, context or "[No heading-specific evidence found; use the complete analysis.]"
 
     # Retrieval can remain heading-focused, but the LLM receives every heading
@@ -282,7 +305,7 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
 
     retrieved = dict(await asyncio.gather(*(bounded_retrieve(heading) for heading in headings)))
     evidence = "\n\n".join(f"## {heading}\n{retrieved[heading]}" for heading in headings)
-    analysis_json = json.dumps(analysis.model_dump(mode="json"), ensure_ascii=False)
+    analysis_json = json.dumps(_analysis_prompt_payload(analysis), ensure_ascii=False)
     heading_json = json.dumps(headings, ensure_ascii=False)
     prompt = f"""Write the complete {document_type} as one coherent grounded paper.
 Return exactly one valid JSON object with this shape:
@@ -313,7 +336,7 @@ HEADING-RELATED REPOSITORY EVIDENCE:
         }
     except Exception as error:
         logger.warning("Report LLM response was unusable project_id=%s document_type=%s error=%s",
-                       project_id, document_type, type(error).__name__)
+                       project_id, document_type, str(error)[:300])
         by_heading = {}
 
     first_pass_sections = [

@@ -53,7 +53,7 @@ def test_groq_provider_uses_structured_chat_completions():
     headers = client.calls[0][1]["headers"]
     payload = client.calls[0][1]["json"]
     assert headers["Authorization"] == "Bearer test-key"
-    assert payload["model"] == "qwen/qwen3.6-27b"
+    assert payload["model"] == "qwen/qwen3.8-27b"
     assert payload["response_format"] == {"type": "json_object"}
 
     long_result = GroqLLMProvider(api_key="test-key", client=FakeClient([
@@ -61,6 +61,13 @@ def test_groq_provider_uses_structured_chat_completions():
     ]), max_retries=0)
     run(long_result.generate("prompt", max_tokens=5000))
     assert long_result.client.calls[0][1]["json"]["max_tokens"] == 5000
+
+
+def test_groq_provider_migrates_deprecated_qwen_model():
+    client = FakeClient([FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]})])
+    provider = GroqLLMProvider(api_key="test-key", model="qwen/qwen3.6-27b", client=client, max_retries=0)
+    run(provider.generate("prompt"))
+    assert client.calls[0][1]["json"]["model"] == "qwen/qwen3.8-27b"
 
 
 def test_groq_provider_reports_safe_api_errors():

@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     lightning_api_key: str | None = None
     lightning_embedding_timeout: float = Field(default=120.0, gt=0, le=900)
     groq_api_key: str | None = None
-    groq_model: str = "qwen/qwen3.6-27b"
+    groq_model: str = "qwen/qwen3.8-27b"
     groq_timeout: float = Field(default=120.0, gt=0, le=900)
     groq_max_retries: int = Field(default=2, ge=0, le=5)
     embedding_dimension: int = Field(default=768, gt=0)

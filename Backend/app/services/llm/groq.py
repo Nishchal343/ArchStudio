@@ -11,13 +11,19 @@ class GroqLLMProvider(LLMProvider):
     """Groq Chat Completions adapter used by Step 6 generation only."""
 
     endpoint = "https://api.groq.com/openai/v1/chat/completions"
+    deprecated_model_aliases = {
+        # Groq deprecated Qwen 3.6 in September 2026. Keep deployed
+        # environments with the old variable working during rollout.
+        "qwen/qwen3.6-27b": "qwen/qwen3.8-27b",
+    }
 
     def __init__(self, api_key: str | None = None, model: str | None = None,
                  timeout: float | None = None, max_retries: int | None = None,
                  client: Any = None):
         settings = get_settings()
         self.api_key = api_key if api_key is not None else settings.groq_api_key
-        self.model = model or settings.groq_model
+        configured_model = model or settings.groq_model
+        self.model = self.deprecated_model_aliases.get(configured_model, configured_model)
         self.timeout = settings.groq_timeout if timeout is None else timeout
         self.max_retries = settings.groq_max_retries if max_retries is None else max_retries
         self.client = client
