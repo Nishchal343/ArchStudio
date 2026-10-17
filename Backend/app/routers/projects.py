@@ -31,7 +31,7 @@ from ..services.rag.retrieval import search_project
 from ..services.embeddings.base import EmbeddingProviderError
 from ..services.analysis.service import AnalysisServiceError, analyze_project
 from ..services.llm.base import LLMProviderError
-from ..services.artifacts.reports import generate_report
+from ..services.artifacts.reports import ReportGenerationError, generate_report
 from ..services.artifacts.diagrams import architecture_diagram, database_diagram, enrich_diagram_explanation, render_diagram
 from ..services.artifacts.export import export_document
 from ..services.chat.service import answer_project_question
@@ -442,7 +442,16 @@ async def generate_artifact_in_background(artifact_id: str) -> None:
             logger.info("Artifact generation started artifact_id=%s kind=%s project_id=%s",
                         artifact.id, artifact.kind.value, artifact.project_id)
             if artifact.kind in {ArtifactKind.REPORT, ArtifactKind.IEEE_REPORT, ArtifactKind.RESEARCH_PAPER}:
-                payload = (await generate_report(db, artifact.project_id, artifact.kind.value)).model_dump(mode="json")
+                async def report_progress(heading: str) -> None:
+                    artifact.error_message = f"Generating {heading}..."
+                    await db.commit()
+
+                payload = (await generate_report(
+                    db,
+                    artifact.project_id,
+                    artifact.kind.value,
+                    progress_callback=report_progress,
+                )).model_dump(mode="json")
             elif artifact.kind == ArtifactKind.DATABASE_DIAGRAM:
                 diagram = await enrich_diagram_explanation(database_diagram(artifact.project_id))
                 diagram.mermaid = f"%% ARCHSTUDIO_EXPLANATION {diagram.explanation.replace(chr(10), ' ')}\n{diagram.mermaid}"
@@ -463,6 +472,9 @@ async def generate_artifact_in_background(artifact_id: str) -> None:
             result = await db.execute(select(ProjectArtifact).where(ProjectArtifact.id == uuid.UUID(artifact_id)))
             artifact = result.scalar_one_or_none()
             if artifact:
+                partial_document = getattr(error, "partial_document", None)
+                if isinstance(error, ReportGenerationError) and partial_document:
+                    artifact.payload = partial_document.model_dump(mode="json")
                 artifact.status = ArtifactStatus.FAILED
                 artifact.error_message = artifact_generation_error_message(error)
                 await db.commit()

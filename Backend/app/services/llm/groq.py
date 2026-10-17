@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 
 from ...config import get_settings
-from .base import LLMProvider, LLMProviderError
+from .base import LLMGeneration, LLMProvider, LLMProviderError
 
 
 class GroqLLMProvider(LLMProvider):
@@ -35,6 +35,9 @@ class GroqLLMProvider(LLMProvider):
         )
 
     async def generate(self, prompt: str, max_tokens: int | None = None) -> str:
+        return (await self.generate_with_metadata(prompt, max_tokens=max_tokens)).content
+
+    async def generate_with_metadata(self, prompt: str, max_tokens: int | None = None) -> LLMGeneration:
         own_client = self.client is None
         client = self.client or httpx.AsyncClient(timeout=self.http_timeout)
         try:
@@ -48,16 +51,22 @@ class GroqLLMProvider(LLMProvider):
                         "temperature": 0.1,
                     }
                     if max_tokens is not None:
-                        request_payload["max_tokens"] = max_tokens
+                        request_payload["max_completion_tokens"] = max_tokens
                     response = await client.post(
                         self.endpoint,
                         headers={"Authorization": f"Bearer {self.api_key}"},
                         json=request_payload,
                     )
-                    # Retrying a 429 immediately consumes more requests and
-                    # cannot clear a provider quota. Surface it directly.
                     if response.status_code == 429:
-                        raise LLMProviderError("Groq API rate limit reached")
+                        if attempt < self.max_retries:
+                            retry_after = 0.0
+                            try:
+                                retry_after = float(response.headers.get("retry-after", 0))
+                            except (AttributeError, TypeError, ValueError):
+                                pass
+                            await asyncio.sleep(min(30.0, max(retry_after, 0.5 * (2 ** attempt))))
+                            continue
+                        raise LLMProviderError("Groq API rate limit reached after bounded retries")
                     if response.status_code == 408 or response.status_code >= 500:
                         if attempt < self.max_retries:
                             await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
@@ -87,11 +96,19 @@ class GroqLLMProvider(LLMProvider):
                         )
                     data = response.json()
                     choices = data.get("choices") if isinstance(data, dict) else None
-                    message = choices[0].get("message") if isinstance(choices, list) and choices else None
+                    choice = choices[0] if isinstance(choices, list) and choices else None
+                    message = choice.get("message") if isinstance(choice, dict) else None
                     generated = message.get("content") if isinstance(message, dict) else None
                     if not isinstance(generated, str) or not generated.strip():
                         raise LLMProviderError("Groq returned an empty or malformed generation")
-                    return generated
+                    usage = data.get("usage") if isinstance(data, dict) else {}
+                    return LLMGeneration(
+                        content=generated,
+                        finish_reason=choice.get("finish_reason") if isinstance(choice, dict) else None,
+                        prompt_tokens=usage.get("prompt_tokens") if isinstance(usage, dict) else None,
+                        completion_tokens=usage.get("completion_tokens") if isinstance(usage, dict) else None,
+                        total_tokens=usage.get("total_tokens") if isinstance(usage, dict) else None,
+                    )
                 except (httpx.TimeoutException, httpx.NetworkError) as error:
                     if attempt >= self.max_retries:
                         raise LLMProviderError("Groq API is unavailable") from error

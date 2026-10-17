@@ -20,9 +20,10 @@ def run(coro):
 
 
 class FakeResponse:
-    def __init__(self, status_code, body):
+    def __init__(self, status_code, body, headers=None):
         self.status_code = status_code
         self.body = body
+        self.headers = headers or {}
 
     def json(self):
         return self.body
@@ -60,7 +61,7 @@ def test_groq_provider_uses_structured_chat_completions():
         FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]})
     ]), max_retries=0)
     run(long_result.generate("prompt", max_tokens=5000))
-    assert long_result.client.calls[0][1]["json"]["max_tokens"] == 5000
+    assert long_result.client.calls[0][1]["json"]["max_completion_tokens"] == 5000
 
 
 def test_groq_provider_migrates_deprecated_qwen_model():
@@ -78,6 +79,28 @@ def test_groq_provider_reports_safe_api_errors():
     malformed = GroqLLMProvider(api_key="test-key", client=FakeClient([FakeResponse(200, {})]), max_retries=0)
     with pytest.raises(LLMProviderError, match="malformed"):
         run(malformed.generate("prompt"))
+
+
+def test_groq_provider_exposes_completion_metadata_and_truncation():
+    client = FakeClient([FakeResponse(200, {
+        "choices": [{"finish_reason": "length", "message": {"content": '{"content":"partial"}'}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 500, "total_tokens": 600},
+    })])
+    provider = GroqLLMProvider(api_key="test-key", client=client, max_retries=0)
+    result = run(provider.generate_with_metadata("prompt", max_tokens=500))
+    assert result.truncated is True
+    assert result.prompt_tokens == 100
+    assert result.completion_tokens == 500
+
+
+def test_groq_provider_retries_rate_limit_with_backoff():
+    client = FakeClient([
+        FakeResponse(429, {}, headers={"retry-after": "0"}),
+        FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+    ])
+    provider = GroqLLMProvider(api_key="test-key", client=client, max_retries=1)
+    assert run(provider.generate("prompt")) == "{}"
+    assert len(client.calls) == 2
 
 
 def test_provider_factory_uses_groq_by_default(monkeypatch):

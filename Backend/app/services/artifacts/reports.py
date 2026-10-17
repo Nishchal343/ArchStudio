@@ -1,5 +1,6 @@
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 import json
 import logging
@@ -13,6 +14,7 @@ from ...database import SessionLocal
 from ..analysis.service import analyze_project
 from ..storage_service import project_directory
 from ..rag.retrieval import search_project
+from ..llm.base import LLMGeneration, LLMProviderError
 from ..llm.service import get_llm_provider
 from ...config import get_settings
 from .templates import predefined_template
@@ -80,7 +82,7 @@ def _bounded_prompt_text(value: str, limit: int) -> str:
 
 
 def _analysis_prompt_payload(analysis: AnalysisResult) -> dict:
-    """Keep the single report request below provider token limits."""
+    """Keep each section request below provider token limits."""
     payload = analysis.model_dump(mode="json")
     for key, value in list(payload.items()):
         if isinstance(value, str):
@@ -161,38 +163,158 @@ def _finalize_report_sections(
     return finalized
 
 
-async def _template_sections(db: AsyncSession, project_id: UUID, template: dict, analysis: AnalysisResult) -> list[tuple[str, str]]:
-    settings = get_settings()
-    fallback = {heading.lower(): _text(content) for heading, content in _default_sections(analysis)}
-    semaphore = asyncio.Semaphore(4)
+class ReportGenerationError(LLMProviderError):
+    """A report section failed after bounded retries, with partial output kept."""
 
-    async def render_section(item: dict) -> tuple[str, str]:
-        heading = str(item.get("heading", "")).strip()
-        if not heading:
-            return "", ""
-        try:
-            async with semaphore:
-                # Each concurrent section gets its own DB session. AsyncSession is
-                # not safe to share across concurrent retrievals.
-                async with SessionLocal() as section_db:
-                    results = await search_project(section_db, project_id, heading, top_k=4,
-                                                   min_similarity=settings.analysis_min_similarity)
-                context = "\n\n".join(f"FILE: {r['file_path']}:{r.get('start_line')}-{r.get('end_line')}\n{r['content']}" for r in results)
-                prompt = ("Write one report section using only the project evidence below. The predefined application format supplies "
-                          "headings and layout only; never copy template facts, authors, citations, metrics, or claims. "
-                          "If evidence is insufficient, state that clearly. Return JSON only: {\"content\": \"...\"}.\n\n"
-                          f"SECTION: {heading}\nPROJECT EVIDENCE:\n{context or '[No supporting evidence found.]'}")
-                raw = await get_llm_provider().generate(prompt)
-                parsed = json.loads(raw)
-                content = parsed.get("content") if isinstance(parsed, dict) else None
-                if not isinstance(content, str) or not content.strip():
-                    raise ValueError("empty section")
-        except Exception:
-            content = fallback.get(heading.lower(), "This section is not supported by the available project evidence.")
-        return heading, content
+    def __init__(self, heading: str, message: str, partial_document: EditableDocument):
+        super().__init__(f"Report section '{heading}' could not be generated: {message}")
+        self.heading = heading
+        self.partial_document = partial_document
 
-    rendered = await asyncio.gather(*(render_section(item) for item in template.get("sections", [])))
-    return [(heading, content) for heading, content in rendered if heading]
+
+def _section_word_target(document_type: str, heading: str) -> tuple[int, int]:
+    """Return target/minimum words for one generated section."""
+    if document_type == "ieee_report":
+        targets = {"Abstract": (160, 90), "Conclusion": (220, 130)}
+        return targets.get(heading, (220, 130))
+    targets = {"Abstract": (220, 120), "Conclusion": (320, 200)}
+    return targets.get(heading, (500, 300))
+
+
+def _section_output_tokens(document_type: str, heading: str, target_words: int) -> int:
+    """Leave room for JSON syntax while bounding one request's completion."""
+    maximum = 1200 if document_type == "ieee_report" else 1600
+    return min(maximum, max(500, int(target_words * 1.8)))
+
+
+def _section_analysis_context(analysis: AnalysisResult, heading: str) -> str:
+    fields = {
+        "Abstract": ("summary", "overview"),
+        "Introduction": ("overview", "project_structure"),
+        "Proposed Methodology": ("architecture", "project_structure", "component_relationships"),
+        "System Architecture": ("architecture", "components", "component_relationships"),
+        "Implementation Technology": ("technology_stack", "dependencies"),
+        "Results and Discussion": ("code_quality", "security_findings", "performance_findings", "maintainability_findings"),
+        "Future Scope": ("recommendations", "maintainability_findings"),
+        "Conclusion": ("summary", "architecture", "recommendations"),
+    }.get(heading, ("overview", "architecture"))
+    payload = _analysis_prompt_payload(analysis)
+    return json.dumps({field: payload.get(field) for field in fields}, ensure_ascii=False)
+
+
+def _previous_report_context(sections: list[tuple[str, str]]) -> str:
+    if not sections:
+        return "[No previous generated sections.]"
+    return "\n\n".join(
+        f"{heading}: {_bounded_prompt_text(content, 650)}"
+        for heading, content in sections[-2:]
+    )
+
+
+def _section_failure_document(
+    document_type: str,
+    layout: dict,
+    headings: list[str],
+    sections: list[tuple[str, str]],
+    failed_heading: str,
+    failure_message: str,
+    fallback: dict[str, str],
+) -> EditableDocument:
+    completed = {heading.lower(): content for heading, content in sections}
+    partial_sections = []
+    for heading in headings:
+        if heading.lower() in completed:
+            content = completed[heading.lower()]
+        elif heading == failed_heading:
+            content = f"Section generation failed: {failure_message}"
+        elif heading.lower() in _USER_INPUT_HEADING_KEYS:
+            content = fallback.get(heading.lower(), USER_INPUT_SECTIONS[heading])
+        else:
+            content = "Not generated because an earlier report section failed."
+        partial_sections.append(ReportSection(heading=heading, content=_text(content)))
+    return EditableDocument(
+        title="USER INPUT REQUIRED â€” Enter paper title",
+        document_type=document_type,
+        authors=[{"name": "USER INPUT REQUIRED â€” Enter author name", "institution": ""}],
+        date="",
+        sections=partial_sections,
+        layout=layout,
+    )
+
+
+async def _retrieve_section_evidence(
+    project_id: UUID,
+    heading: str,
+    settings,
+) -> str:
+    async with SessionLocal() as section_db:
+        results = await search_project(
+            section_db,
+            project_id,
+            heading,
+            top_k=4,
+            min_similarity=settings.analysis_min_similarity,
+        )
+    evidence = []
+    for result in results[:4]:
+        evidence.append(
+            f"FILE: {result['file_path']}:{result.get('start_line')}-{result.get('end_line')}\n"
+            f"{_bounded_prompt_text(result.get('content', ''), 1400)}"
+        )
+    return "\n\n".join(evidence) or "[No heading-specific evidence found.]"
+
+
+def _section_prompt(
+    document_type: str,
+    heading: str,
+    target_words: int,
+    minimum_words: int,
+    analysis_context: str,
+    evidence: str,
+    previous_context: str,
+) -> str:
+    return f"""Generate only the report section named '{heading}' for a {document_type}.
+Return exactly one valid JSON object and no Markdown:
+{{"content": "section prose only"}}
+
+The section target is approximately {target_words} words, with at least {minimum_words} meaningful words unless the supplied evidence genuinely cannot support that length. Use connected academic prose with paragraphs. Explain the section's topic, relevant implementation details, repository-grounded evidence, limitations, and examples where supported. Avoid repetition and filler.
+
+Use only the supplied project analysis and evidence. Do not invent metrics, citations, external papers, authors, features, or implementation details. Repository evidence is grounding input only: never copy FILE blocks, file paths with source excerpts, Python, JavaScript, JSX, HTML, configuration, JSON, or fenced code. Do not discuss topics belonging to another heading. Do not generate the user's reserved research sections; those are handled by the application.
+
+PROJECT ANALYSIS RELEVANT TO THIS SECTION:
+{analysis_context}
+
+SECTION-SPECIFIC REPOSITORY EVIDENCE:
+{evidence}
+
+LIMITED PREVIOUS REPORT CONTEXT:
+{previous_context}
+"""
+
+
+def _parse_section_generation(
+    generation: LLMGeneration,
+    heading: str,
+    minimum_words: int,
+) -> str:
+    if generation.truncated:
+        raise ValueError(f"provider truncated the response ({generation.finish_reason})")
+    try:
+        parsed = json.loads(generation.content)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("provider returned invalid JSON") from error
+    content = parsed.get("content") if isinstance(parsed, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("provider returned empty section content")
+    content = content.strip()
+    if _looks_like_source_dump(content):
+        raise ValueError("provider returned copied source evidence instead of prose")
+    content = _clean_model_section(content, "")
+    if len(content.split()) < minimum_words:
+        raise ValueError(
+            f"provider returned {len(content.split())} words; at least {minimum_words} were required"
+        )
+    return content
 
 
 def _default_sections(analysis: AnalysisResult) -> list[tuple[str, object]]:
@@ -266,7 +388,12 @@ def _ieee_report_sections(analysis: AnalysisResult) -> list[tuple[str, object]]:
     ]
 
 
-async def generate_report(db: AsyncSession, project_id: UUID, document_type: str) -> EditableDocument:
+async def generate_report(
+    db: AsyncSession,
+    project_id: UUID,
+    document_type: str,
+    progress_callback: Callable[[str], Awaitable[None]] | None = None,
+) -> EditableDocument:
     analysis = await _analysis_for_project(db, project_id)
 
     template = predefined_template(document_type)
@@ -277,80 +404,71 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
     fallback = {heading.lower(): _text(content) for heading, content in _normal_report_sections(analysis)}
     settings = get_settings()
     headings = [item["heading"] for item in template["sections"]]
+    generated_sections: list[tuple[str, str]] = []
+    provider = get_llm_provider()
+    for heading in headings:
+        if heading.lower() in _USER_INPUT_HEADING_KEYS:
+            generated_sections.append((heading, fallback.get(heading.lower(), USER_INPUT_SECTIONS[heading])))
+            continue
 
-    async def retrieve_for_heading(heading: str) -> tuple[str, str]:
-        async with SessionLocal() as section_db:
-            results = await search_project(section_db, project_id, heading, top_k=2,
-                                           min_similarity=settings.analysis_min_similarity)
-        evidence = []
-        for result in results[:2]:
-            content = _bounded_prompt_text(result.get("content", ""), 900)
-            evidence.append(
-                f"FILE: {result['file_path']}:{result.get('start_line')}-{result.get('end_line')}\n{content}"
+        if progress_callback:
+            await progress_callback(heading)
+        target_words, minimum_words = _section_word_target(document_type, heading)
+        output_tokens = _section_output_tokens(document_type, heading, target_words)
+        try:
+            evidence = await _retrieve_section_evidence(project_id, heading, settings)
+            prompt = _section_prompt(
+                document_type,
+                heading,
+                target_words,
+                minimum_words,
+                _section_analysis_context(analysis, heading),
+                evidence,
+                _previous_report_context(generated_sections),
             )
-        context = "\n\n".join(evidence)
-        return heading, context or "[No heading-specific evidence found; use the complete analysis.]"
-
-    # Retrieval can remain heading-focused, but the LLM receives every heading
-    # and all evidence in one request so it can write a coherent paper with
-    # consistent depth and transitions instead of isolated one-line sections.
-    # Keep retrieval concurrent, but bounded.  Each search performs an embedding
-    # request and a database query; launching all twelve at once exhausts the
-    # database pool and causes intermittent 503s while the UI is polling.
-    retrieval_semaphore = asyncio.Semaphore(3)
-
-    async def bounded_retrieve(heading: str) -> tuple[str, str]:
-        async with retrieval_semaphore:
-            return await retrieve_for_heading(heading)
-
-    retrieved = dict(await asyncio.gather(*(bounded_retrieve(heading) for heading in headings)))
-    evidence = "\n\n".join(f"## {heading}\n{retrieved[heading]}" for heading in headings)
-    analysis_json = json.dumps(_analysis_prompt_payload(analysis), ensure_ascii=False)
-    heading_json = json.dumps(headings, ensure_ascii=False)
-    prompt = f"""Write the complete {document_type} as one coherent grounded paper.
-Return exactly one valid JSON object with this shape:
-{{"sections": [{{"heading": "exact heading from the list", "content": "substantial section prose"}}]}}
-
-Use every heading exactly once, preserve the exact order below, and do not add, remove, rename, or reorder headings.
-HEADINGS: {heading_json}
-
-Target layout: {template['layout']['columns']} column(s).
-Target length: exactly {template['layout']['page_target']} in the exported document and approximately {template['layout']['target_words']} words of actual content. Write enough connected prose to reach that target; do not pad with blank lines or repeat the same point. Do not leave any section as a one-sentence placeholder: expand each technical section with repository-grounded explanation, implementation details, relationships, limitations, and evidence. For the standard report, aim for at least 350 words in each major technical section. For the IEEE report, aim for at least 150 words in each section while remaining concise.
-Writing style: {template['layout']['depth']}. Make the sections flow as one paper, with useful paragraphs rather than one-line summaries.
-
-Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. Repository evidence is grounding input only: never copy FILE blocks, file paths with source excerpts, Python, JavaScript, JSX, HTML, configuration, JSON, or fenced code into the report. Synthesize the evidence into relevant explanatory prose; do not quote or concatenate retrieved chunks. Do not use evidence from one heading to fill another heading. Do not cite raw FILE/line ranges in the final prose unless the sentence also explains why that file is relevant to the current heading. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, use the exact user-input placeholder when external evidence is unavailable; do not fill those sections with unrelated repository code. The user may paste material from the separate Research/Literature Review feature into those four sections after generation.
-
-COMPLETE PROJECT ANALYSIS:
-{analysis_json}
-
-HEADING-RELATED REPOSITORY EVIDENCE:
-{evidence}
-"""
-    try:
-        raw = await get_llm_provider().generate(prompt, max_tokens=template["layout"]["output_tokens"])
-        parsed = json.loads(raw)
-        generated = parsed.get("sections") if isinstance(parsed, dict) else None
-        by_heading = {
-            str(item.get("heading", "")).strip().lower(): item.get("content")
-            for item in (generated or []) if isinstance(item, dict)
-        }
-    except Exception as error:
-        logger.warning("Report LLM response was unusable project_id=%s document_type=%s error=%s",
-                       project_id, document_type, str(error)[:300])
-        by_heading = {}
-
-    first_pass_sections = [
-        (heading, by_heading.get(heading.lower()) if isinstance(by_heading.get(heading.lower()), str)
-         and by_heading[heading.lower()].strip() else _text(fallback.get(heading.lower(), "Evidence unavailable.")))
-        for heading in headings
-    ]
-
-    # Retrieved excerpts are grounding material for the model only. They must
-    # never be appended directly to a report: doing that created unrelated
-    # source-code dumps and allowed one heading's evidence to leak into another.
-    sections = _finalize_report_sections(first_pass_sections, fallback)
+            last_error = None
+            content = None
+            for attempt in range(2):
+                try:
+                    generation = await provider.generate_with_metadata(prompt, max_tokens=output_tokens)
+                    content = _parse_section_generation(generation, heading, minimum_words)
+                    break
+                except Exception as error:
+                    last_error = error
+                    if attempt == 0:
+                        prompt += (
+                            f"\n\nRETRY FOR {heading}: The previous response was incomplete or invalid. "
+                            f"Return at least {minimum_words} words of prose in the required JSON object."
+                        )
+                        await asyncio.sleep(0.2)
+            if content is None:
+                raise ValueError(str(last_error or "empty section response"))
+            generated_sections.append((heading, content))
+            logger.info(
+                "Report section generated project_id=%s document_type=%s heading=%s words=%s "
+                "finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                project_id, document_type, heading, len(content.split()),
+                generation.finish_reason, generation.prompt_tokens,
+                generation.completion_tokens, generation.total_tokens,
+            )
+        except Exception as error:
+            message = str(error)[:300] or "unknown generation error"
+            logger.warning(
+                "Report section failed project_id=%s document_type=%s heading=%s error=%s",
+                project_id, document_type, heading, message,
+            )
+            partial = _section_failure_document(
+                document_type,
+                template["layout"],
+                headings,
+                generated_sections,
+                heading,
+                message,
+                fallback,
+            )
+            raise ReportGenerationError(heading, message, partial) from error
     return EditableDocument(title="USER INPUT REQUIRED — Enter paper title", document_type=document_type,
                             authors=[{"name": "USER INPUT REQUIRED — Enter author name", "institution": ""}],
                             date="",
-                            sections=[ReportSection(heading=h, content=_text(c)) for h, c in sections],
+                            sections=[ReportSection(heading=heading, content=_text(content)) for heading, content in generated_sections],
                             layout=template["layout"])

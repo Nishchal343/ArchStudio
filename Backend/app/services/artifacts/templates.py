@@ -16,6 +16,7 @@ MASTER_SECTIONS = [
 PAPER_VARIANTS = {
     "report": {"columns": 1, "depth": "detailed", "page_target": "10 pages", "target_words": 4200, "output_tokens": 7500, "minimum_pages": 10, "page_count": 10},
     "ieee_report": {"columns": 2, "depth": "concise and technically dense", "page_target": "4 pages", "target_words": 1800, "output_tokens": 3500, "minimum_pages": 4, "page_count": 4},
+    "research_paper": {"columns": 1, "depth": "detailed and research-oriented", "page_target": "10 pages", "target_words": 4200, "output_tokens": 7500, "minimum_pages": 10, "page_count": 10},
 }
 
 

@@ -1,15 +1,24 @@
 import io
 import asyncio
+import json
+import re
 from uuid import uuid4
 
 import pytest
 
-from app.schemas import DiagramPayload, EditableDocument, ReportSection
+from app.schemas import AnalysisResult, DiagramPayload, EditableDocument, ReportSection
 from app.services.artifacts.diagrams import database_diagram, render_diagram
 from app.services.artifacts.export import export_document
-from app.services.artifacts.reports import _clean_model_section, _finalize_report_sections
+from app.services.artifacts.reports import (
+    ReportGenerationError,
+    _clean_model_section,
+    _finalize_report_sections,
+    _parse_section_generation,
+    generate_report,
+)
 from app.services.chat.service import answer_project_question
 from app.services.artifacts.export import _section_break_indices
+from app.services.llm.base import LLMGeneration, LLMProviderError
 
 
 def document():
@@ -36,6 +45,77 @@ def test_report_keeps_user_research_sections_as_placeholders():
     finalized = _finalize_report_sections(sections, fallback)
     assert finalized[0][1].startswith("USER INPUT REQUIRED")
     assert finalized[1][1] == "Relevant architecture prose."
+
+
+def test_report_generates_each_non_placeholder_section_separately(monkeypatch):
+    project_id = uuid4()
+    analysis = AnalysisResult(project_id=project_id, overview="Grounded project overview.",
+                              summary="Grounded project summary.", architecture="Grounded architecture.")
+
+    class FakeProvider:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_with_metadata(self, prompt, max_tokens=None):
+            self.calls.append((prompt, max_tokens))
+            heading = re.search(r"section named '([^']+)'", prompt).group(1)
+            content = " ".join([heading, "is supported by the analyzed repository and its documented implementation details."] * 80)
+            return LLMGeneration(json.dumps({"content": content}), finish_reason="stop")
+
+    provider = FakeProvider()
+    monkeypatch.setattr("app.services.artifacts.reports._analysis_for_project", lambda db, pid: _completed(analysis))
+    monkeypatch.setattr("app.services.artifacts.reports._retrieve_section_evidence", lambda *args: _evidence())
+    monkeypatch.setattr("app.services.artifacts.reports.get_llm_provider", lambda: provider)
+
+    document = asyncio.run(generate_report(None, project_id, "ieee_report"))
+
+    assert len(provider.calls) == 8
+    assert len(document.sections) == 12
+    assert all('"sections"' not in prompt for prompt, _ in provider.calls)
+    assert all("FILE: Backend/app.py:1-10" in prompt for prompt, _ in provider.calls)
+    assert document.sections[2].content.startswith("USER INPUT REQUIRED")
+    pdf, _, _ = export_document(document, "pdf")
+    docx, _, _ = export_document(document, "docx")
+    assert pdf.startswith(b"%PDF") and docx[:2] == b"PK"
+
+
+def test_report_failure_preserves_generated_sections(monkeypatch):
+    project_id = uuid4()
+    analysis = AnalysisResult(project_id=project_id, overview="Grounded overview.",
+                              summary="Grounded summary.", architecture="Grounded architecture.")
+
+    class FailingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def generate_with_metadata(self, prompt, max_tokens=None):
+            self.calls += 1
+            if self.calls > 1:
+                raise LLMProviderError("Groq API rate limit reached")
+            return LLMGeneration(json.dumps({"content": " ".join(["Abstract grounded content."] * 140)}), finish_reason="stop")
+
+    provider = FailingProvider()
+    monkeypatch.setattr("app.services.artifacts.reports._analysis_for_project", lambda db, pid: _completed(analysis))
+    monkeypatch.setattr("app.services.artifacts.reports._retrieve_section_evidence", lambda *args: _evidence())
+    monkeypatch.setattr("app.services.artifacts.reports.get_llm_provider", lambda: provider)
+
+    with pytest.raises(ReportGenerationError) as raised:
+        asyncio.run(generate_report(None, project_id, "ieee_report"))
+
+    partial = raised.value.partial_document
+    assert partial.sections[0].content.startswith("Abstract grounded")
+    assert partial.sections[1].heading == "Introduction"
+    assert "failed" in partial.sections[1].content.lower()
+    assert "rate limit" in str(raised.value)
+
+
+def test_report_rejects_truncated_section_response():
+    with pytest.raises(ValueError, match="truncated"):
+        _parse_section_generation(
+            LLMGeneration('{"content":"incomplete', finish_reason="length"),
+            "Introduction",
+            10,
+        )
 
 
 def test_document_exports_are_real_files():
@@ -100,3 +180,11 @@ def test_chat_retries_vague_insufficient_evidence_answer(monkeypatch):
     result = asyncio.run(answer_project_question(None, uuid4(), "What improvements can be made?", 5, provider))
     assert provider.calls == 2
     assert "loading state" in result.answer
+
+
+async def _completed(analysis):
+    return analysis
+
+
+async def _evidence():
+    return "FILE: Backend/app.py:1-10\nThe backend coordinates the application flow."
