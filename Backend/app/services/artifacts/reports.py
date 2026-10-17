@@ -71,6 +71,64 @@ def _prose(value, subject: str = "The project") -> str:
     return str(value or "Evidence unavailable.")
 
 
+def _expand_sections_with_evidence(
+    sections: list[tuple[str, str]],
+    retrieved: dict[str, str],
+    target_words: int,
+) -> list[tuple[str, str]]:
+    """Add grounded source detail when a model response is under-length.
+
+    A model can validly return a coherent paper that is still far shorter than
+    the requested page target. The previous exporter then spread that short
+    paper over many mostly empty pages. Retrieved FILE excerpts are primary
+    repository evidence, so adding concise evidence anchors increases useful
+    content without inventing claims or repeating generic filler.
+    """
+    current_words = sum(len(content.split()) for _, content in sections)
+    if current_words >= target_words:
+        return sections
+
+    fragments: list[tuple[str, str]] = []
+    for heading, context in retrieved.items():
+        context = str(context or "").strip()
+        if not context or context.startswith("[No heading-specific evidence"):
+            continue
+        words = context.replace("\n", " ").split()
+        if words:
+            fragments.append((heading, " ".join(words[:280])))
+    if not fragments:
+        return sections
+
+    enriched = list(sections)
+    used_fragments: set[int] = set()
+    while current_words < target_words and len(used_fragments) < len(fragments):
+        for index, (heading, content) in enumerate(enriched):
+            if current_words >= target_words:
+                break
+            fragment_index = next(
+                (candidate for candidate, (fragment_heading, _) in enumerate(fragments)
+                 if candidate not in used_fragments and fragment_heading.lower() == heading.lower()),
+                None,
+            )
+            if fragment_index is None:
+                fragment_index = next(
+                    (candidate for candidate in range(len(fragments)) if candidate not in used_fragments),
+                    None,
+                )
+            if fragment_index is None:
+                continue
+            used_fragments.add(fragment_index)
+            _, fragment = fragments[fragment_index]
+            remaining = target_words - current_words
+            addition_words = fragment.split()[:min(280, remaining)]
+            if not addition_words:
+                continue
+            addition = "Evidence detail from the indexed repository: " + " ".join(addition_words)
+            enriched[index] = (heading, f"{content}\n\n{addition}")
+            current_words += len(addition.split())
+    return enriched
+
+
 async def _template_sections(db: AsyncSession, project_id: UUID, template: dict, analysis: AnalysisResult) -> list[tuple[str, str]]:
     settings = get_settings()
     fallback = {heading.lower(): _text(content) for heading, content in _default_sections(analysis)}
@@ -255,7 +313,11 @@ HEADING-RELATED REPOSITORY EVIDENCE:
     # The first pass already receives the complete analysis and all retrieved
     # evidence. A second full-document LLM call doubled generation time and
     # frequently hit the provider timeout, without adding new evidence.
-    sections = first_pass_sections
+    sections = _expand_sections_with_evidence(
+        first_pass_sections,
+        retrieved,
+        int(template["layout"]["target_words"]),
+    )
     return EditableDocument(title="USER INPUT REQUIRED — Enter paper title", document_type=document_type,
                             authors=[{"name": "USER INPUT REQUIRED — Enter author name", "institution": ""}],
                             date="",
