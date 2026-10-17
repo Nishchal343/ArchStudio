@@ -17,7 +17,7 @@ from app.services.artifacts.reports import (
     generate_report,
 )
 from app.services.chat.service import answer_project_question
-from app.services.artifacts.export import _section_break_indices
+from app.services.artifacts.export import _page_groups, _section_break_indices
 from app.services.llm.base import LLMGeneration, LLMProviderError
 
 
@@ -28,6 +28,8 @@ def document():
 
 def test_report_pagination_does_not_insert_artificial_section_breaks():
     assert _section_break_indices(12, 10) == set()
+    sections = [ReportSection(heading="A", content="one"), ReportSection(heading="B", content="two")]
+    assert _page_groups(sections, 10) == [sections]
 
 
 def test_report_rejects_raw_retrieval_excerpts():
