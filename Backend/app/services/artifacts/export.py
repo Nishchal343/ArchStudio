@@ -13,11 +13,59 @@ def _minimum_pages(layout: dict) -> int:
 
 
 def _section_break_indices(section_count: int, minimum_pages: int) -> set[int]:
-    """Return no artificial breaks; document flow determines pagination."""
-    # A minimum page target must not be achieved by inserting blank space.
-    # ReportLab and Word will naturally continue content onto the next page
-    # when the current page is full.
+    """Legacy compatibility helper retained for existing callers/tests."""
     return set()
+
+
+def _target_pages(layout: dict) -> int:
+    configured = layout.get("page_count")
+    if configured:
+        return max(1, int(configured))
+    return _minimum_pages(layout)
+
+
+def _page_groups(sections: list, target_pages: int) -> list[list]:
+    """Distribute report sections across explicit output pages.
+
+    The old exporter left pagination entirely to the flowable engine, so a
+    short model response could collapse a ten-page report into two pages. A
+    section-balanced page plan keeps every target page populated while still
+    allowing normal paragraph flow inside each page/column.
+    """
+    groups = [[] for _ in range(target_pages)]
+    if not sections:
+        return groups
+    total_words = sum(len(str(section.content or "").split()) for section in sections)
+    page_budget = max(1, (total_words + target_pages - 1) // target_pages)
+    page = 0
+    words_on_page = 0
+    for section in sections:
+        words = str(section.content or "").split()
+        if not words:
+            groups[page].append(section)
+            continue
+        first_chunk = True
+        while words:
+            available = page_budget - words_on_page if page < target_pages - 1 else len(words)
+            chunk_size = max(1, min(len(words), available))
+            chunk = " ".join(words[:chunk_size])
+            words = words[chunk_size:]
+            heading = section.heading if first_chunk else f"{section.heading} (continued)"
+            groups[page].append(section.model_copy(update={"heading": heading, "content": chunk}))
+            first_chunk = False
+            words_on_page += chunk_size
+            if words and page < target_pages - 1:
+                page += 1
+                words_on_page = 0
+    # A short fallback document still needs every requested page populated by
+    # a section. Move the last available sections into empty trailing pages.
+    for page_index in range(target_pages):
+        if groups[page_index]:
+            continue
+        donor = next((index for index in range(target_pages - 1, page_index, -1) if len(groups[index]) > 1), None)
+        if donor is not None:
+            groups[page_index].append(groups[donor].pop())
+    return groups
 
 from ...schemas import EditableDocument
 
@@ -46,13 +94,14 @@ def export_document(document: EditableDocument, output_format: str) -> tuple[byt
             paragraph.add_run("    ".join(f"{author.get('name', '[AUTHOR]')}\n{author.get('institution', '[INSTITUTION / AFFILIATION]')}" for author in row))
         date = doc.add_paragraph(document.date)
         date.alignment = 1
-        breaks = _section_break_indices(len(document.sections), _minimum_pages(document.layout))
-        for index, section in enumerate(document.sections):
-            if index in breaks:
+        groups = _page_groups(document.sections, _target_pages(document.layout))
+        for page_index, group in enumerate(groups):
+            if page_index:
                 doc.add_page_break()
-            doc.add_heading(section.heading, level=1)
-            for paragraph in section.content.split("\n"):
-                doc.add_paragraph(paragraph)
+            for section in group:
+                doc.add_heading(section.heading, level=1)
+                for paragraph in section.content.split("\n"):
+                    doc.add_paragraph(paragraph)
         doc.save(stream)
         return stream.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"
     if output_format == "pdf":
@@ -79,12 +128,13 @@ def export_document(document: EditableDocument, output_format: str) -> tuple[byt
             author_text = " &nbsp;&nbsp;&nbsp; ".join(f"{a.get('name', '[AUTHOR]')}<br/>{a.get('institution', '[INSTITUTION / AFFILIATION]')}" for a in row)
             story.append(Paragraph(author_text, styles["BodyText"]))
         story.append(Paragraph(document.date, styles["BodyText"]))
-        breaks = _section_break_indices(len(document.sections), _minimum_pages(document.layout))
-        for index, section in enumerate(document.sections):
-            if index in breaks:
+        groups = _page_groups(document.sections, _target_pages(document.layout))
+        for page_index, group in enumerate(groups):
+            if page_index:
                 story.append(PageBreak())
-            story.extend([Spacer(1, 8), Paragraph(section.heading, styles["Heading2"])])
-            story.extend(Paragraph(paragraph, styles["BodyText"]) for paragraph in section.content.split("\n") if paragraph.strip())
+            for section in group:
+                story.extend([Spacer(1, 8), Paragraph(section.heading, styles["Heading2"])])
+                story.extend(Paragraph(paragraph, styles["BodyText"]) for paragraph in section.content.split("\n") if paragraph.strip())
         pdf.build(story)
         return stream.getvalue(), "application/pdf", "pdf"
     raise ValueError("Unsupported document format")

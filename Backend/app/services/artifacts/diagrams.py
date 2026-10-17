@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import textwrap
 from pathlib import Path
 from uuid import UUID
 
@@ -27,6 +28,85 @@ def mermaid_from_graph(nodes: list[dict], edges: list[dict]) -> str:
     for edge in edges:
         lines.append(f"    {edge['source']} -->|{edge.get('label', '')}| {edge['target']}")
     return "\n".join(lines)
+
+
+def _normalise_source_path(value: str) -> str:
+    """Return a comparable repository-relative path."""
+    return value.replace("\\", "/").lstrip("./").lower()
+
+
+def _python_import_modules(path: str, content: str) -> set[str]:
+    """Extract absolute and relative Python modules, including from-imports."""
+    modules: set[str] = set()
+    package = Path(path).parent.as_posix().replace("/", ".")
+    if package == ".":
+        package = ""
+
+    for match in re.finditer(r"^\s*from\s+([.\w]+)\s+import\s+([^\n]+)", content, re.MULTILINE):
+        module, imported = match.groups()
+        dots = len(module) - len(module.lstrip("."))
+        base = module[dots:]
+        parent_parts = package.split(".") if package else []
+        if dots:
+            parent_parts = parent_parts[:max(0, len(parent_parts) - dots + 1)]
+        absolute = (
+            ".".join([*parent_parts, base]) if dots else base
+        ).strip(".")
+        if absolute:
+            modules.add(absolute)
+        # ``from package import module`` points to both the package and the
+        # imported child module. Resolving both handles either source layout.
+        for name in re.findall(r"[A-Za-z_]\w*", imported.split("#", 1)[0]):
+            if name not in {"as", "type"}:
+                modules.add(".".join(part for part in (absolute, name) if part))
+
+    for match in re.finditer(r"^\s*import\s+([^\n]+)", content, re.MULTILINE):
+        for item in match.group(1).split(","):
+            module = re.split(r"\s+as\s+", item.strip(), maxsplit=1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module):
+                modules.add(module)
+    return modules
+
+
+def _resolve_import_target(source_path: str, reference: str, known_paths: dict[str, str], suffix: str) -> str | None:
+    """Resolve an import/reference to an indexed source file."""
+    reference = reference.replace("\\", "/").strip()
+    source = _normalise_source_path(source_path)
+    candidates: list[str] = []
+
+    if suffix == ".py":
+        module = reference.lstrip(".").replace("/", ".")
+        source_parts = source.rsplit("/", 1)[0].split("/") if "/" in source else []
+        if reference.startswith("."):
+            dots = len(reference) - len(reference.lstrip("."))
+            base = source_parts[:max(0, len(source_parts) - dots + 1)]
+            module = ".".join([*base, module]).strip(".")
+        module_path = module.replace(".", "/")
+        candidates.extend((f"{module_path}.py", f"{module_path}/__init__.py"))
+    elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        if reference.startswith("."):
+            base = f"{source.rsplit('/', 1)[0]}/{reference}" if "/" in source else reference
+        else:
+            base = reference
+        base = _normalise_source_path(base).rstrip("/")
+        candidates.extend(f"{base}{extension}" for extension in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"))
+        candidates.extend(f"{base}/{name}" for name in ("index.js", "index.jsx", "index.ts", "index.tsx"))
+    else:
+        base = _normalise_source_path(reference)
+        candidates.extend((base, f"{base}.h", f"{base}.hpp", f"{base}.c", f"{base}.cpp"))
+
+    for candidate in candidates:
+        if candidate in known_paths:
+            return known_paths[candidate]
+    # Package aliases such as ``@/components/Button`` and Python package
+    # imports can still be matched by their suffix when the repository root
+    # is not part of the import name.
+    for candidate in candidates:
+        suffix_candidate = candidate.lstrip("./")
+        matches = [path for normalised, path in known_paths.items() if normalised.endswith("/" + suffix_candidate) or normalised == suffix_candidate]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
 
 def _architecture_explanation(nodes: list[dict], edges: list[dict]) -> str:
@@ -149,7 +229,13 @@ async def architecture_diagram(db: AsyncSession, project_id: UUID) -> DiagramPay
             edges.append({"source": source, "target": target, "label": label})
 
     ignored = {".md", ".rst", ".txt", ".pdf", ".doc", ".docx", ".lock"}
-    source_paths = [path for path in files if Path(path).suffix.lower() not in ignored]
+    compose_names = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+    runtime_paths = [path for path in files if Path(path).name.lower() in compose_names]
+    source_paths = [
+        path for path in files
+        if Path(path).suffix.lower() not in ignored and Path(path).name.lower() not in compose_names
+    ]
+    known_paths = {_normalise_source_path(path): path for path in source_paths}
     key_names = {"main", "app", "application", "server", "index", "route", "api", "pipeline", "service", "models", "settings"}
     capability_patterns = {
         "OCR / document vision": r"\b(?:ocr|paddleocr|tesseract|easyocr)\b",
@@ -173,28 +259,41 @@ async def architecture_diagram(db: AsyncSession, project_id: UUID) -> DiagramPay
     for pattern in capability_patterns.values():
         selected.extend(path for path in source_paths if re.search(pattern, files[path], re.IGNORECASE) and path not in selected[:24])
     selected = list(dict.fromkeys(selected))[:24]
+
+    # Expand from the important files into their actual internal dependencies.
+    # The old implementation compared only filename stems (``service``), which
+    # misses package imports such as ``from app.services.foo import run`` and
+    # leaves most of the architecture as disconnected boxes.
+    def import_references(path: str) -> set[str]:
+        suffix = Path(path).suffix.lower()
+        content = files[path]
+        if suffix == ".py":
+            return _python_import_modules(path, content)
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            return set(re.findall(r"(?:from\s+|import\s+|import\s*\(|require\s*\()\s*[\"']([^\"']+)", content))
+        if suffix in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}:
+            return set(re.findall(r"#include\s*[<\"]([^>\"]+)", content))
+        return set()
+
+    max_nodes = 36
+    cursor = 0
+    while cursor < len(selected) and len(selected) < max_nodes:
+        current = selected[cursor]
+        cursor += 1
+        for reference in import_references(current):
+            target = _resolve_import_target(current, reference, known_paths, Path(current).suffix.lower())
+            if target and target not in selected:
+                selected.append(target)
+                if len(selected) >= max_nodes:
+                    break
     for path in selected:
         add_node(path, path)
 
-    # Resolve common internal import forms to actual indexed files.
-    def imported_stems(content: str, suffix: str) -> set[str]:
-        refs: set[str] = set()
-        if suffix == ".py":
-            refs.update(re.findall(r"(?:from|import)\s+([A-Za-z_][\w.]*)", content))
-        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
-            refs.update(re.findall(r"(?:from|require\()\s*[\"']([^\"']+)", content))
-        else:
-            refs.update(re.findall(r"#include\s*[<\"]([^>\"]+)", content))
-        return {ref.replace("\\", "/").rstrip("/").split("/")[-1].split(".")[0].lower() for ref in refs}
-
     for path in selected:
         source_id = ids[path]
-        stems = imported_stems(files[path], Path(path).suffix.lower())
-        for target in selected:
-            if target == path:
-                continue
-            target_stem = Path(target).stem.lower()
-            if target_stem in stems:
+        for reference in import_references(path):
+            target = _resolve_import_target(path, reference, known_paths, Path(path).suffix.lower())
+            if target in ids and target != path:
                 add_edge(source_id, ids[target], "imports")
 
     for capability, pattern in capability_patterns.items():
@@ -204,13 +303,42 @@ async def architecture_diagram(db: AsyncSession, project_id: UUID) -> DiagramPay
             for path in evidence[:6]:
                 add_edge(ids[path], capability_id, "provides")
 
-    for path in source_paths:
-        if Path(path).name.lower() not in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}:
+    for path in runtime_paths:
+        if Path(path).name.lower() not in compose_names:
             continue
         runtime_id = add_node(f"runtime:{path}", f"Container runtime ({path})", "runtime")
         for target in selected:
             if target != path and (Path(target).suffix.lower() in {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs"}):
                 add_edge(runtime_id, ids[target], "orchestrates")
+
+    # Keep the graph visually navigable even when a valid source file has no
+    # import edge (for example a standalone worker or a config module). The
+    # repository node represents an observed path hierarchy, not an invented
+    # runtime dependency. It also joins multiple legitimate dependency islands
+    # into one architecture graph.
+    if nodes:
+        adjacency = {node["id"]: set() for node in nodes}
+        for edge in edges:
+            adjacency.setdefault(edge["source"], set()).add(edge["target"])
+            adjacency.setdefault(edge["target"], set()).add(edge["source"])
+        components: list[set[str]] = []
+        remaining = set(adjacency)
+        while remaining:
+            start = remaining.pop()
+            component = {start}
+            stack = [start]
+            while stack:
+                current = stack.pop()
+                for neighbour in adjacency[current] & remaining:
+                    remaining.remove(neighbour)
+                    component.add(neighbour)
+                    stack.append(neighbour)
+            components.append(component)
+        if len(components) > 1:
+            repository_id = add_node("architecture:repository", "Repository structure", "group")
+            for component in components:
+                representative = next(iter(component))
+                add_edge(repository_id, representative, "contains")
 
     if not nodes:
         nodes = [{"id": "n0_empty", "label": "No processed source evidence detected", "kind": "note"}]
@@ -225,6 +353,7 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
     foreign_keys: set[tuple[str, str, str]] = set()
     django_models: dict[str, str] = {}
     django_foreign_keys: list[tuple[str, str, str]] = []
+    file_contents: dict[str, str] = {}
 
     def django_type(field_type: str) -> str:
         return {
@@ -254,22 +383,22 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
         # Model declarations commonly span several lines, and a chunk boundary
         # or an additional field option should not turn a real relationship into
         # an isolated table in the generated diagram.
-        for column, target_model in re.findall(
-            r"^\s{4}(\w+)\s*=\s*models\.ForeignKey\(\s*([A-Za-z_]\w*)",
+        for column, quoted_target, bare_target in re.findall(
+            r"^\s{4}(\w+)\s*=\s*models\.(?:ForeignKey|OneToOneField|ManyToManyField)\(\s*(?:[\"'](?:\w+\.)?([A-Za-z_]\w*)[\"']|([A-Za-z_]\w*))",
             body,
             re.MULTILINE,
         ):
-            django_foreign_keys.append((table_name, target_model.lower(), column))
+            django_foreign_keys.append((table_name, (quoted_target or bare_target).lower(), column))
 
         field_pattern = re.compile(
             r"^\s{4}(\w+)\s*=\s*models\.(\w+)\((.*?)(?=^\s{4}\w+\s*=\s*models\.|^\s{4}class\s|\Z)",
             re.MULTILINE | re.DOTALL,
         )
         for column, field_type, declaration in field_pattern.findall(body):
-            if field_type == "ForeignKey":
-                target = re.search(r"models\.ForeignKey\(\s*([A-Za-z_]\w*)", declaration)
+            if field_type in {"ForeignKey", "OneToOneField", "ManyToManyField"}:
+                target = re.search(r"models\.(?:ForeignKey|OneToOneField|ManyToManyField)\(\s*(?:[\"'](?:\w+\.)?([A-Za-z_]\w*)[\"']|([A-Za-z_]\w*))", declaration)
                 if target:
-                    django_foreign_keys.append((table_name, target.group(1).lower(), column))
+                    django_foreign_keys.append((table_name, (target.group(1) or target.group(2)).lower(), column))
             # Django stores a ForeignKey as the target model's integer primary
             # key (the database column is normally named ``<field>_id``).
             # Rendering it as TEXT makes the relationship easy to miss in an
@@ -282,9 +411,12 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
         with path.open("r", encoding="utf-8") as source:
             for line in source:
                 try:
-                    content = json.loads(line).get("content", "")
+                    item = json.loads(line)
+                    content = item.get("content", "")
                 except json.JSONDecodeError:
                     continue
+                file_key = str(item.get("file_path") or "")
+                file_contents[file_key] = file_contents.get(file_key, "") + content
                 for table in re.findall(r"__tablename__\s*=\s*[\"']([^\"']+)", content):
                     tables.setdefault(table, [])
                 for model_match in re.finditer(
@@ -328,7 +460,7 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                             if target_table and target_table != table:
                                 foreign_keys.add((table, target_table, column))
                 for table_match in re.finditer(
-                    r"CREATE TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(\w+)\s*\((?P<body>.*?)(?=\n[ \t]+\)(?:\s|$))",
+                    r"CREATE TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(\w+)\s*\((?P<body>.*?)(?=\n[ \t]+\)(?:\s|$)|\)\s*;)",
                     content, re.IGNORECASE | re.DOTALL
                 ):
                     table = table_match.group(1)
@@ -398,10 +530,117 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
                             if target:
                                 django_foreign_keys.append((table_name, target.group(1).lower(), column))
 
+    # Chunks are created by line count, so a class or migration can be split
+    # across several records. Re-run relationship discovery on reconstructed
+    # files; this is what makes model declarations connect reliably.
+    for content in file_contents.values():
+        for model_match in re.finditer(
+            r"class\s+(\w+)\s*\(\s*models\.Model\s*\)\s*:(.*?)(?=^class\s+\w+\s*\(|\Z)",
+            content,
+            re.DOTALL | re.MULTILINE,
+        ):
+            add_django_model(model_match.group(1), model_match.group(2))
+
+        for class_match in re.finditer(
+            r"__tablename__\s*=\s*[\"']([^\"']+)[\"'](?P<body>.*?)(?=\nclass\s|\Z)",
+            content,
+            re.DOTALL,
+        ):
+            table = class_match.group(1)
+            tables.setdefault(table, [])
+            for column, declaration in re.findall(
+                r"^\s{4}(\w+)\s*(?::[^=\n]+)?=\s*(?:mapped_column|Column)\(([^\n]*)\)",
+                class_match.group("body"),
+                re.MULTILINE,
+            ):
+                target = re.search(r"ForeignKey\(\s*[\"']([^\"']+)[\"']", declaration)
+                if target:
+                    target_table, _, _ = target.group(1).rpartition(".")
+                    foreign_keys.add((table, target_table or target.group(1), column))
+
+        for table_match in re.finditer(
+            r"CREATE TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(\w+)\s*\((?P<body>.*?)(?=\n\s*\)(?:\s*;|\s*$)|\)\s*;)",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            table = table_match.group(1)
+            body = table_match.group("body")
+            for column, target_table, _target_column in re.findall(
+                r"FOREIGN\s+KEY\s*\(\s*(\w+)\s*\)\s*REFERENCES\s+([\w.-]+)\s*\(\s*(\w+)\s*\)",
+                body,
+                re.IGNORECASE,
+            ):
+                foreign_keys.add((table, target_table, column))
+            for column, target_table, _target_column in re.findall(
+                r"^\s*(\w+)\s+[^\n,]*?REFERENCES\s+([\w.-]+)\s*\(\s*(\w+)\s*\)",
+                body,
+                re.IGNORECASE | re.MULTILINE,
+            ):
+                foreign_keys.add((table, target_table, column))
+
+        for migration_match in re.finditer(
+            r"migrations\.CreateModel\(\s*name\s*=\s*[\"'](\w+)[\"'](?P<body>.*?)(?=\n\s*migrations\.(?:CreateModel|AddField|AlterField|DeleteModel)|\Z)",
+            content,
+            re.DOTALL,
+        ):
+            model_name = migration_match.group(1)
+            body = migration_match.group("body")
+            table_match = re.search(r"[\"']db_table[\"']\s*:\s*[\"']([^\"']+)", body)
+            table_name = table_match.group(1) if table_match else re.sub(r"(?<!^)(?=[A-Z])", "_", model_name).lower()
+            django_models[model_name.lower()] = table_name
+            tables.setdefault(table_name, [])
+            for field_match in re.finditer(
+                r"\(\s*[\"'](\w+)[\"']\s*,\s*models\.(?:ForeignKey|OneToOneField|ManyToManyField)\((.*?)(?=\n\s*\(\s*[\"']\w+[\"']\s*,|\n\s*\]\s*)",
+                body,
+                re.DOTALL,
+            ):
+                column, declaration = field_match.groups()
+                target = re.search(r"to\s*=\s*[\"'](?:\w+\.)?(\w+)[\"']", declaration)
+                if target:
+                    django_foreign_keys.append((table_name, target.group(1).lower(), column))
+
+    def table_key(value: str) -> str:
+        value = value.strip().strip("`\"'").lower()
+        return value.rsplit(".", 1)[-1]
+
+    aliases: dict[str, set[str]] = {}
+    for table in tables:
+        forms = {table_key(table)}
+        if forms:
+            singular = next(iter(forms))
+            forms.add(singular[:-1] if singular.endswith("s") else f"{singular}s")
+        for form in forms:
+            aliases.setdefault(form, set()).add(table)
+    for model_name, table in django_models.items():
+        if table in tables:
+            aliases.setdefault(table_key(model_name), set()).add(table)
+
+    def resolve_table(value: str) -> str | None:
+        candidates = aliases.get(table_key(value), set())
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    # Conventional ``owner_id`` columns are useful evidence even when a
+    # migration omitted an explicit constraint. Resolve them only when the
+    # corresponding table name is unambiguous.
+    for child, columns in tables.items():
+        for column, _column_type in columns:
+            if column.lower().endswith("_id"):
+                parent = resolve_table(column[:-3])
+                if parent and parent != child:
+                    foreign_keys.add((child, parent, column))
+
+    resolved_foreign_keys: set[tuple[str, str, str]] = set()
+    for child, parent, column in foreign_keys:
+        resolved_child = resolve_table(child)
+        resolved_parent = resolve_table(parent)
+        if resolved_child and resolved_parent and resolved_child != resolved_parent:
+            resolved_foreign_keys.add((resolved_child, resolved_parent, column))
     for child_table, target_model, column in django_foreign_keys:
-        parent_table = django_models.get(target_model, target_model)
-        if child_table in tables and parent_table in tables:
-            foreign_keys.add((child_table, parent_table, column))
+        resolved_child = resolve_table(child_table)
+        resolved_parent = resolve_table(django_models.get(target_model, target_model))
+        if resolved_child and resolved_parent and resolved_child != resolved_parent:
+            resolved_foreign_keys.add((resolved_child, resolved_parent, column))
+    foreign_keys = resolved_foreign_keys
     if not tables:
         return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
                               mermaid='flowchart TD\n    empty["No database schema detected."]',
@@ -410,19 +649,35 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
     nodes = [{"id": _node_id(name, index), "label": name, "kind": "table",
               "columns": [{"name": col, "type": typ} for col, typ in columns]}
              for index, (name, columns) in enumerate(tables.items())]
+    known_tables = {node["label"] for node in nodes}
+    mermaid_table_names: dict[str, str] = {}
+    used_mermaid_names: set[str] = set()
+    for node in nodes:
+        base = re.sub(r"[^A-Za-z0-9_]", "_", node["label"]).strip("_") or "table"
+        if base[0].isdigit():
+            base = f"table_{base}"
+        candidate = base
+        suffix = 2
+        while candidate in used_mermaid_names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used_mermaid_names.add(candidate)
+        mermaid_table_names[node["label"]] = candidate
     mermaid_lines = ["erDiagram"]
     for node in nodes:
-        mermaid_lines.append(f"    {node['label']} {{")
+        mermaid_lines.append(f"    {mermaid_table_names[node['label']]} {{")
         for column in node["columns"]:
-            mermaid_lines.append(f"        {column['type']} {column['name']}")
+            column_name = re.sub(r"[^A-Za-z0-9_]", "_", column["name"]).strip("_") or "column"
+            mermaid_lines.append(f"        {column['type']} {column_name}")
         mermaid_lines.append("    }")
-    known_tables = {node["label"] for node in nodes}
     emitted_relationships: set[tuple[str, str]] = set()
     for child, parent, _column in sorted(foreign_keys):
         if child in known_tables and parent in known_tables:
             relationship = (parent, child)
             if relationship not in emitted_relationships:
-                mermaid_lines.append(f"    {parent} ||--o{{ {child} : contains")
+                mermaid_lines.append(
+                    f"    {mermaid_table_names[parent]} ||--o{{ {mermaid_table_names[child]} : contains"
+                )
                 emitted_relationships.add(relationship)
     table_ids = {node["label"]: node["id"] for node in nodes}
     return DiagramPayload(title="Database Diagram", diagram_type="database_diagram",
@@ -437,85 +692,250 @@ def database_diagram(project_id: UUID) -> DiagramPayload:
 
 
 def render_diagram(payload: DiagramPayload, output_format: str) -> tuple[bytes, str, str]:
-    positions = {
-        node["id"]: (40 + (index % 3) * 290, 40 + (index // 3) * 100)
-        for index, node in enumerate(payload.nodes)
-    }
+    import io
+
+    if not payload.nodes:
+        raise ValueError("Cannot render an empty diagram")
+
+    node_by_id = {node["id"]: node for node in payload.nodes}
     endpoint_ids = {node["label"]: node["id"] for node in payload.nodes}
+    edges = [
+        edge for edge in payload.edges
+        if (edge.get("source") in node_by_id or edge.get("source") in endpoint_ids)
+        and (edge.get("target") in node_by_id or edge.get("target") in endpoint_ids)
+    ]
 
-    def position_for(endpoint: str):
-        node_id = endpoint if endpoint in positions else endpoint_ids.get(endpoint)
-        if node_id not in positions:
+    def resolve_endpoint(endpoint: str) -> str:
+        node_id = endpoint if endpoint in node_by_id else endpoint_ids.get(endpoint)
+        if node_id not in node_by_id:
             raise ValueError(f"Diagram edge references unknown node: {endpoint}")
-        return positions[node_id]
+        return node_id
 
-    def edge_points(edge):
-        """Clip connectors to node boundaries so they never run through boxes."""
-        sx, sy = position_for(edge["source"])
-        tx, ty = position_for(edge["target"])
-        sx, sy, tx, ty = sx + 110, sy + 25, tx + 110, ty + 25
-        dx, dy = tx - sx, ty - sy
-        if dx == 0 and dy == 0:
-            return sx, sy, tx, ty
-        scale = min(110 / abs(dx) if dx else float("inf"), 25 / abs(dy) if dy else float("inf"))
-        return sx + dx * scale, sy + dy * scale, tx - dx * scale, ty - dy * scale
+    edges = [
+        {**edge, "source": resolve_endpoint(edge["source"]), "target": resolve_endpoint(edge["target"])}
+        for edge in edges
+        if edge.get("source") != edge.get("target")
+    ]
+
+    is_schema = payload.diagram_type.value == "database_diagram" if hasattr(payload.diagram_type, "value") else payload.diagram_type == "database_diagram"
+    node_width = 300 if is_schema else 260
+    horizontal_gap = 110
+    vertical_gap = 38
+    margin = 42
+
+    def wrapped_lines(value: str, width: int = 30) -> list[str]:
+        lines = textwrap.wrap(str(value), width=width, break_long_words=True, break_on_hyphens=False)
+        return lines or [""]
+
+    def node_lines(node: dict) -> list[str]:
+        return wrapped_lines(str(node.get("label", "")), 32 if is_schema else 30)
+
+    def node_size(node: dict) -> tuple[int, int]:
+        if node.get("columns"):
+            return node_width, min(420, 42 + 24 * len(node["columns"]))
+        return node_width, max(62, 28 + 20 * len(node_lines(node)))
+
+    sizes = {node["id"]: node_size(node) for node in payload.nodes}
+    node_ids = list(node_by_id)
+    outgoing = {node_id: [] for node_id in node_ids}
+    incoming = {node_id: [] for node_id in node_ids}
+    for edge in edges:
+        outgoing[edge["source"]].append(edge["target"])
+        incoming[edge["target"]].append(edge["source"])
+
+    # Assign columns from the dependency direction. Kahn's algorithm keeps
+    # cyclic modules in a stable first column instead of endlessly increasing
+    # their rank.
+    indegree = {node_id: len(incoming[node_id]) for node_id in node_ids}
+    rank = {node_id: 0 for node_id in node_ids}
+    queue = [node_id for node_id in node_ids if indegree[node_id] == 0]
+    processed: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        processed.add(current)
+        for target in outgoing[current]:
+            rank[target] = max(rank[target], rank[current] + 1)
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                queue.append(target)
+    for node_id in node_ids:
+        if node_id not in processed:
+            rank[node_id] = 0
+
+    layers: dict[int, list[str]] = {}
+    for node_id in node_ids:
+        layers.setdefault(rank[node_id], []).append(node_id)
+    for layer in layers.values():
+        layer.sort(key=lambda node_id: str(node_by_id[node_id].get("label", "")).lower())
+
+    # Barycentric ordering reduces edge crossings between adjacent columns.
+    for _ in range(4):
+        order = {node_id: index for layer in layers.values() for index, node_id in enumerate(layer)}
+        for layer_number in sorted(layers):
+            layer = layers[layer_number]
+            if len(layer) < 2:
+                continue
+            def barycenter(node_id: str) -> tuple[float, str]:
+                neighbours = incoming[node_id] + outgoing[node_id]
+                positions = [order[neighbour] for neighbour in neighbours if neighbour in order]
+                return (sum(positions) / len(positions) if positions else float("inf"), str(node_by_id[node_id].get("label", "")).lower())
+            layer.sort(key=barycenter)
+
+    layer_heights = {
+        layer_number: sum(sizes[node_id][1] for node_id in layer) + vertical_gap * max(0, len(layer) - 1)
+        for layer_number, layer in layers.items()
+    }
+    canvas_height = max(180, margin * 2 + max(layer_heights.values()))
+    positions: dict[str, tuple[float, float, int, int]] = {}
+    for layer_number, layer in layers.items():
+        x = margin + layer_number * (node_width + horizontal_gap)
+        y = margin + (canvas_height - margin * 2 - layer_heights[layer_number]) / 2
+        for node_id in layer:
+            width, height = sizes[node_id]
+            positions[node_id] = (x, y, width, height)
+            y += height + vertical_gap
+    canvas_width = max(360, margin * 2 + (max(layers) + 1) * node_width + max(0, max(layers)) * horizontal_gap)
+
+    def connector(edge: dict) -> tuple[list[tuple[float, float]], tuple[float, float]]:
+        sx, sy, sw, sh = positions[edge["source"]]
+        tx, ty, tw, th = positions[edge["target"]]
+        if tx > sx:
+            start = (sx + sw, sy + sh / 2)
+            end = (tx, ty + th / 2)
+            bend_x = (start[0] + end[0]) / 2
+            points = [start, (bend_x, start[1]), (bend_x, end[1]), end]
+        elif tx < sx:
+            start = (sx, sy + sh / 2)
+            end = (tx + tw, ty + th / 2)
+            bend_x = (start[0] + end[0]) / 2
+            points = [start, (bend_x, start[1]), (bend_x, end[1]), end]
+        else:
+            start = (sx + sw / 2, sy + sh)
+            end = (tx + tw / 2, ty)
+            bend_y = min(start[1], end[1]) - 24
+            points = [start, (start[0], bend_y), (end[0], bend_y), end]
+        # Remove duplicate points so labels and arrowheads remain stable.
+        clean_points = [points[0]]
+        for point in points[1:]:
+            if point != clean_points[-1]:
+                clean_points.append(point)
+        midpoint = clean_points[len(clean_points) // 2]
+        return clean_points, midpoint
+
+    def arrowhead(points: list[tuple[float, float]], size: float = 9) -> list[tuple[float, float]]:
+        x2, y2 = points[-1]
+        x1, y1 = points[-2]
+        angle = math.atan2(y2 - y1, x2 - x1)
+        return [
+            (x2, y2),
+            (x2 - size * math.cos(angle - math.pi / 6), y2 - size * math.sin(angle - math.pi / 6)),
+            (x2 - size * math.cos(angle + math.pi / 6), y2 - size * math.sin(angle + math.pi / 6)),
+        ]
 
     if output_format == "svg":
-        width, height = 900, max(180, 100 + len(payload.nodes) * 70)
-        parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-                 '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#555"/></marker></defs>',
-                 '<style>text{font-family:Arial,sans-serif;font-size:14px}rect{fill:#eef4ff;stroke:#315d9b;stroke-width:2}line{stroke:#555;stroke-width:2}</style>']
-        for index, node in enumerate(payload.nodes):
-            x, y = positions[node["id"]]
-            parts.append(f'<rect x="{x}" y="{y}" width="220" height="50" rx="8"/><text x="{x + 110}" y="{y + 30}" text-anchor="middle">{_svg_escape(node["label"])}</text>')
-        for edge in payload.edges:
-            x1, y1, x2, y2 = edge_points(edge)
-            label = _svg_escape(str(edge.get("label", "")))
-            parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" marker-end="url(#arrow)"/>')
-            if label:
-                lx, ly = (x1 + x2) / 2, (y1 + y2) / 2 - 4
-                parts.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" paint-order="stroke" stroke="white" stroke-width="5">{label}</text>')
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_width}" height="{canvas_height}" viewBox="0 0 {canvas_width} {canvas_height}">',
+            '<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#64748b"/></marker></defs>',
+            '<style>text{font-family:Arial,sans-serif;fill:#172033;font-size:13px} .edge{fill:none;stroke:#94a3b8;stroke-width:1.8} .card{fill:#f8fafc;stroke:#2563eb;stroke-width:1.6} .header{fill:#e8f0ff} .rule{stroke:#cbd5e1;stroke-width:1}</style>',
+        ]
+        for edge in edges:
+            points, midpoint = connector(edge)
+            path_data = " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+            parts.append(f'<path class="edge" d="M {path_data}" marker-end="url(#arrow)"/>')
+            if edge.get("label"):
+                label = _svg_escape(str(edge["label"]))
+                parts.append(f'<text x="{midpoint[0]:.1f}" y="{midpoint[1] - 5:.1f}" text-anchor="middle" paint-order="stroke" stroke="white" stroke-width="5">{label}</text>')
+        for node in payload.nodes:
+            x, y, width, height = positions[node["id"]]
+            parts.append(f'<rect class="card" x="{x:.1f}" y="{y:.1f}" width="{width}" height="{height}" rx="10"/>')
+            if node.get("columns"):
+                parts.append(f'<rect class="header" x="{x + 1:.1f}" y="{y + 1:.1f}" width="{width - 2}" height="32" rx="9"/>')
+                parts.append(f'<line class="rule" x1="{x:.1f}" y1="{y + 34:.1f}" x2="{x + width:.1f}" y2="{y + 34:.1f}"/>')
+                parts.append(f'<text x="{x + 12:.1f}" y="{y + 22:.1f}" font-weight="bold">{_svg_escape(str(node["label"]))}</text>')
+                for index, column in enumerate(node["columns"]):
+                    value = f'{column.get("type", "") } {column.get("name", "")}'.strip()
+                    parts.append(f'<text x="{x + 12:.1f}" y="{y + 54 + index * 22:.1f}">{_svg_escape(value)}</text>')
+            else:
+                for index, line in enumerate(node_lines(node)):
+                    parts.append(f'<text x="{x + width / 2:.1f}" y="{y + 28 + index * 19:.1f}" text-anchor="middle">{_svg_escape(line)}</text>')
         parts.append("</svg>")
         return "".join(parts).encode(), "image/svg+xml", "svg"
+
     if output_format == "png":
         from PIL import Image, ImageDraw
-        image = Image.new("RGB", (900, max(180, 100 + len(payload.nodes) * 70)), "white")
+
+        image = Image.new("RGB", (int(canvas_width), int(canvas_height)), "white")
         draw = ImageDraw.Draw(image)
-        for edge in payload.edges:
-            x1, y1, x2, y2 = edge_points(edge)
-            draw.line((x1, y1, x2, y2), fill="#555555", width=3)
-            angle = math.atan2(y2 - y1, x2 - x1)
-            size = 9
-            draw.polygon([
-                (x2, y2),
-                (x2 - size * math.cos(angle - math.pi / 6), y2 - size * math.sin(angle - math.pi / 6)),
-                (x2 - size * math.cos(angle + math.pi / 6), y2 - size * math.sin(angle + math.pi / 6)),
-            ], fill="#555555")
+        for edge in edges:
+            points, midpoint = connector(edge)
+            draw.line(points, fill="#94a3b8", width=2, joint="curve")
+            draw.polygon(arrowhead(points), fill="#64748b")
             if edge.get("label"):
-                draw.text(((x1 + x2) / 2, (y1 + y2) / 2 - 14), str(edge["label"]), fill="#333333")
-        for index, node in enumerate(payload.nodes):
-            x, y = positions[node["id"]]
-            draw.rounded_rectangle((x, y, x + 220, y + 50), radius=8, fill="#eef4ff", outline="#315d9b", width=2)
-            draw.text((x + 10, y + 18), node["label"], fill="black")
-        import io
-        stream = io.BytesIO(); image.save(stream, format="PNG")
+                draw.text((midpoint[0], midpoint[1] - 16), str(edge["label"]), fill="#334155", anchor="mm")
+        for node in payload.nodes:
+            x, y, width, height = positions[node["id"]]
+            draw.rounded_rectangle((x, y, x + width, y + height), radius=10, fill="#f8fafc", outline="#2563eb", width=2)
+            if node.get("columns"):
+                draw.rectangle((x + 1, y + 1, x + width - 1, y + 34), fill="#e8f0ff")
+                draw.line((x, y + 34, x + width, y + 34), fill="#cbd5e1", width=1)
+                draw.text((x + 12, y + 18), str(node["label"]), fill="#172033", anchor="lm")
+                for index, column in enumerate(node["columns"]):
+                    value = f'{column.get("type", "") } {column.get("name", "")}'.strip()
+                    draw.text((x + 12, y + 54 + index * 22), value, fill="#334155", anchor="lm")
+            else:
+                draw.multiline_text((x + width / 2, y + height / 2), "\n".join(node_lines(node)), fill="#172033", anchor="mm", align="center", spacing=2)
+        stream = io.BytesIO()
+        image.save(stream, format="PNG")
         return stream.getvalue(), "image/png", "png"
+
     if output_format == "pdf":
         from reportlab.pdfgen import canvas
-        import io
-        stream = io.BytesIO(); pdf = canvas.Canvas(stream, pagesize=(900, max(180, 100 + len(payload.nodes) * 70)))
-        for edge in payload.edges:
-            x1, y1, x2, y2 = edge_points(edge)
-            pdf.setStrokeColorRGB(0.33, 0.33, 0.33)
-            pdf.setLineWidth(2)
-            pdf.line(x1, y1, x2, y2)
-            angle = math.atan2(y2 - y1, x2 - x1)
-            size = 8
-            pdf.setFillColorRGB(0.33, 0.33, 0.33)
-            pdf.wedge(x2 - size, y2 - size, x2 + size, y2 + size,
-                      math.degrees(angle) - 30, 60)
-        for index, node in enumerate(payload.nodes):
-            x, y = positions[node["id"]]
-            pdf.rect(x, y, 220, 50); pdf.drawString(x + 10, y + 22, node["label"])
-        pdf.save(); return stream.getvalue(), "application/pdf", "pdf"
+
+        stream = io.BytesIO()
+        pdf = canvas.Canvas(stream, pagesize=(canvas_width, canvas_height))
+
+        def pdf_point(point: tuple[float, float]) -> tuple[float, float]:
+            return point[0], canvas_height - point[1]
+
+        for edge in edges:
+            points, midpoint = connector(edge)
+            pdf.setStrokeColorRGB(0.58, 0.65, 0.72)
+            pdf.setLineWidth(1.5)
+            for start, end in zip(points, points[1:]):
+                pdf.line(*pdf_point(start), *pdf_point(end))
+            arrow = arrowhead(points)
+            pdf.setFillColorRGB(0.39, 0.45, 0.54)
+            pdf.setStrokeColorRGB(0.39, 0.45, 0.54)
+            pdf.line(*pdf_point(arrow[0]), *pdf_point(arrow[1]))
+            pdf.line(*pdf_point(arrow[0]), *pdf_point(arrow[2]))
+            if edge.get("label"):
+                pdf.setFillColorRGB(0.2, 0.25, 0.32)
+                pdf.setFont("Helvetica", 8)
+                pdf.drawCentredString(midpoint[0], canvas_height - midpoint[1] + 5, str(edge["label"]))
+        for node in payload.nodes:
+            x, y, width, height = positions[node["id"]]
+            pdf_y = canvas_height - y - height
+            pdf.setFillColorRGB(0.97, 0.98, 0.99)
+            pdf.setStrokeColorRGB(0.15, 0.39, 0.92)
+            pdf.roundRect(x, pdf_y, width, height, 10, fill=1, stroke=1)
+            pdf.setFillColorRGB(0.91, 0.94, 1)
+            if node.get("columns"):
+                pdf.rect(x + 1, pdf_y + height - 34, width - 2, 33, fill=1, stroke=0)
+                pdf.setFillColorRGB(0.09, 0.13, 0.2)
+                pdf.setFont("Helvetica-Bold", 10)
+                pdf.drawString(x + 12, pdf_y + height - 22, str(node["label"])[:42])
+                pdf.setFillColorRGB(0.2, 0.25, 0.32)
+                pdf.setFont("Helvetica", 8)
+                for index, column in enumerate(node["columns"]):
+                    value = f'{column.get("type", "") } {column.get("name", "")}'.strip()
+                    pdf.drawString(x + 12, pdf_y + height - 54 - index * 22, value[:46])
+            else:
+                pdf.setFillColorRGB(0.09, 0.13, 0.2)
+                pdf.setFont("Helvetica", 9)
+                lines = node_lines(node)
+                first_y = pdf_y + height / 2 + (len(lines) - 1) * 7
+                for index, line in enumerate(lines):
+                    pdf.drawCentredString(x + width / 2, first_y - index * 14, line)
+        pdf.save()
+        return stream.getvalue(), "application/pdf", "pdf"
     raise ValueError("Unsupported diagram format")

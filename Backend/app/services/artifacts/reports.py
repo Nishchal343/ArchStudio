@@ -180,20 +180,11 @@ async def generate_report(db: AsyncSession, project_id: UUID, document_type: str
     analysis = await _analysis_for_project(db, project_id)
 
     template = predefined_template(document_type)
-    fallback = {
-        "abstract": analysis.summary or analysis.overview,
-        "introduction": analysis.overview or analysis.project_structure,
-        "literature review": "The available repository evidence does not contain external literature; this section requires the supplied reference papers for a literature-grounded discussion.",
-        "research gap & motivation": "The repository evidence describes the implemented system but does not establish a validated research gap; the gap should be refined against the reference literature.",
-        "proposed methodology": analysis.overview + "\n\n" + analysis.architecture,
-        "system architecture": analysis.architecture + "\n\n" + _prose(analysis.components, "Components"),
-        "implementation technology": _prose(analysis.technology_stack, "The implementation uses"),
-        "comparison with existing system": "A comparison requires the supplied reference papers. The repository evidence alone supports describing this implementation, not claiming superiority over an unobserved system.",
-        "results and discussion": "Verified implementation observations:\n" + _prose(analysis.performance_findings, "Performance evidence"),
-        "future scope": _prose(analysis.recommendations, "Evidence-based future improvements"),
-        "conclusion": analysis.summary or analysis.overview,
-        "references": "The analyzed repository is the available primary source. No external citation is added without supplied reference material.",
-    }
+    # Use the complete grounded report structure as the fallback. The previous
+    # fallback reduced most headings to one or two sentences, which made a
+    # report appear complete in the editor but export as only a few pages when
+    # the model response was short or unavailable.
+    fallback = {heading.lower(): _text(content) for heading, content in _normal_report_sections(analysis)}
     settings = get_settings()
     headings = [item["heading"] for item in template["sections"]]
 
@@ -231,7 +222,7 @@ Use every heading exactly once, preserve the exact order below, and do not add, 
 HEADINGS: {heading_json}
 
 Target layout: {template['layout']['columns']} column(s).
-Target length: {template['layout']['page_target']} and approximately {template['layout']['target_words']} words of actual content. Write enough connected prose to reach that target; do not pad with blank lines or repeat the same point.
+Target length: exactly {template['layout']['page_target']} in the exported document and approximately {template['layout']['target_words']} words of actual content. Write enough connected prose to reach that target; do not pad with blank lines or repeat the same point. Do not leave any section as a one-sentence placeholder: expand each technical section with repository-grounded explanation, implementation details, relationships, limitations, and evidence. For the standard report, aim for at least 350 words in each major technical section. For the IEEE report, aim for at least 150 words in each section while remaining concise.
 Writing style: {template['layout']['depth']}. Make the sections flow as one paper, with useful paragraphs rather than one-line summaries.
 
 Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. For every technical section, explain the relevant evidence in detail and cite the supplied FILE and line range in prose where useful. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, explicitly explain when external evidence is unavailable while still providing relevant repository-grounded discussion. The user may paste material from the separate Research/Literature Review feature into those four sections after generation; leave those sections clearly editable and do not fabricate external literature.
