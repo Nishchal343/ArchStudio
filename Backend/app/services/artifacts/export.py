@@ -1,6 +1,7 @@
 import io
 import re
 import textwrap
+from xml.sax.saxutils import escape as xml_escape
 
 
 def _minimum_pages(layout: dict) -> int:
@@ -70,6 +71,11 @@ def _page_groups(sections: list, target_pages: int) -> list[list]:
 from ...schemas import EditableDocument
 
 
+def _pdf_text(value) -> str:
+    """Escape report content before passing it to ReportLab Paragraph."""
+    return xml_escape(str(value or ""))
+
+
 def export_document(document: EditableDocument, output_format: str) -> tuple[bytes, str, str]:
     if output_format == "docx":
         from docx import Document
@@ -122,19 +128,25 @@ def export_document(document: EditableDocument, output_format: str) -> tuple[byt
                               topMargin=0.5 * inch, bottomMargin=0.5 * inch)
         pdf.addPageTemplates([PageTemplate(id="report", frames=frames)])
         styles = getSampleStyleSheet()
-        story = [Paragraph(document.title, styles["Title"])]
+        story = [Paragraph(_pdf_text(document.title), styles["Title"])]
         for index in range(0, len(document.authors), 3):
             row = document.authors[index:index + 3]
-            author_text = " &nbsp;&nbsp;&nbsp; ".join(f"{a.get('name', '[AUTHOR]')}<br/>{a.get('institution', '[INSTITUTION / AFFILIATION]')}" for a in row)
+            author_text = " &nbsp;&nbsp;&nbsp; ".join(
+                f"{_pdf_text(a.get('name', '[AUTHOR]'))}<br/>{_pdf_text(a.get('institution', '[INSTITUTION / AFFILIATION]'))}"
+                for a in row
+            )
             story.append(Paragraph(author_text, styles["BodyText"]))
-        story.append(Paragraph(document.date, styles["BodyText"]))
+        story.append(Paragraph(_pdf_text(document.date), styles["BodyText"]))
         groups = _page_groups(document.sections, _target_pages(document.layout))
         for page_index, group in enumerate(groups):
             if page_index:
                 story.append(PageBreak())
             for section in group:
-                story.extend([Spacer(1, 8), Paragraph(section.heading, styles["Heading2"])])
-                story.extend(Paragraph(paragraph, styles["BodyText"]) for paragraph in section.content.split("\n") if paragraph.strip())
+                story.extend([Spacer(1, 8), Paragraph(_pdf_text(section.heading), styles["Heading2"])])
+                story.extend(
+                    Paragraph(_pdf_text(paragraph), styles["BodyText"])
+                    for paragraph in section.content.split("\n") if paragraph.strip()
+                )
         pdf.build(story)
         return stream.getvalue(), "application/pdf", "pdf"
     raise ValueError("Unsupported document format")
