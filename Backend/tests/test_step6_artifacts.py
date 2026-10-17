@@ -7,6 +7,7 @@ import pytest
 from app.schemas import DiagramPayload, EditableDocument, ReportSection
 from app.services.artifacts.diagrams import database_diagram, render_diagram
 from app.services.artifacts.export import export_document
+from app.services.artifacts.reports import _clean_model_section, _finalize_report_sections
 from app.services.chat.service import answer_project_question
 from app.services.artifacts.export import _section_break_indices
 
@@ -18,6 +19,23 @@ def document():
 
 def test_report_pagination_does_not_insert_artificial_section_breaks():
     assert _section_break_indices(12, 10) == set()
+
+
+def test_report_rejects_raw_retrieval_excerpts():
+    fallback = "The architecture separates the application into coordinated backend and persistence layers."
+    generated = "The architecture is organized around services. Evidence detail from the indexed repository: FILE: Backend/app/services/llm/base.py:1-11 class LLMProvider: pass"
+    assert _clean_model_section(generated, fallback) == fallback
+
+
+def test_report_keeps_user_research_sections_as_placeholders():
+    sections = [("Literature Review", "Unrelated repository source code."), ("System Architecture", "Relevant architecture prose.")]
+    fallback = {
+        "literature review": "USER INPUT REQUIRED — Enter the literature review here.",
+        "system architecture": "Fallback architecture prose.",
+    }
+    finalized = _finalize_report_sections(sections, fallback)
+    assert finalized[0][1].startswith("USER INPUT REQUIRED")
+    assert finalized[1][1] == "Relevant architecture prose."
 
 
 def test_document_exports_are_real_files():

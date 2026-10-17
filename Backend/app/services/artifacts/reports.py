@@ -1,4 +1,5 @@
 import asyncio
+import re
 from uuid import UUID
 import json
 import logging
@@ -71,62 +72,73 @@ def _prose(value, subject: str = "The project") -> str:
     return str(value or "Evidence unavailable.")
 
 
-def _expand_sections_with_evidence(
-    sections: list[tuple[str, str]],
-    retrieved: dict[str, str],
-    target_words: int,
-) -> list[tuple[str, str]]:
-    """Add grounded source detail when a model response is under-length.
+_USER_INPUT_HEADING_KEYS = {heading.lower() for heading in USER_INPUT_SECTIONS}
 
-    A model can validly return a coherent paper that is still far shorter than
-    the requested page target. The previous exporter then spread that short
-    paper over many mostly empty pages. Retrieved FILE excerpts are primary
-    repository evidence, so adding concise evidence anchors increases useful
-    content without inventing claims or repeating generic filler.
+
+def _looks_like_source_dump(content: str) -> bool:
+    """Detect source excerpts that must never become report prose."""
+    if re.search(r"\bFILE:\s*[^\s]+", content, flags=re.IGNORECASE):
+        return True
+    if "className=" in content or "<div" in content or "</" in content:
+        return True
+    code_markers = (
+        r"\bfrom\s+[\w.]+\s+import\s+",
+        r"\bdef\s+\w+\s*\(",
+        r"\bclass\s+\w+\s*[:({]",
+        r"\bfunction\s+\w+\s*\(",
+        r"\b(?:const|let|var)\s+\w+\s*=",
+        r"@(?:abstractmethod|app\.|router\.)",
+    )
+    return sum(bool(re.search(marker, content)) for marker in code_markers) >= 2
+
+
+def _clean_model_section(content: str, fallback: str) -> str:
+    """Keep generated prose while rejecting copied evidence/code blocks.
+
+    Repository retrieval is grounding input, not report content. In
+    particular, a model must not paste FILE blocks, Python, JSX, or HTML into
+    a section just because that section was short.
     """
-    current_words = sum(len(content.split()) for _, content in sections)
-    if current_words >= target_words:
-        return sections
+    text = str(content or "").strip()
+    if not text:
+        return fallback
 
-    fragments: list[tuple[str, str]] = []
-    for heading, context in retrieved.items():
-        context = str(context or "").strip()
-        if not context or context.startswith("[No heading-specific evidence"):
+    text = re.sub(r"```(?:\w+)?\s*.*?```", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    evidence_marker = re.search(
+        r"\b(?:Evidence detail from the indexed repository|PROJECT EVIDENCE|"
+        r"HEADING-RELATED REPOSITORY EVIDENCE)\s*:",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if evidence_marker:
+        text = text[:evidence_marker.start()].strip()
+        # Do not keep a short lead-in after removing the copied evidence; use
+        # the complete fallback for that heading instead.
+        if len(text.split()) < 20:
+            return fallback
+
+    if _looks_like_source_dump(text):
+        return fallback
+    return text or fallback
+
+
+def _finalize_report_sections(
+    sections: list[tuple[str, str]],
+    fallback: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Apply section-specific fallback and protect user-editable sections."""
+    finalized: list[tuple[str, str]] = []
+    for heading, content in sections:
+        key = heading.lower()
+        fallback_content = fallback.get(key, "Evidence unavailable.")
+        # These sections require user-provided literature/comparison material.
+        # Repository code is not a valid substitute and often produces
+        # unrelated paragraphs when the model tries to fill the space.
+        if key in _USER_INPUT_HEADING_KEYS:
+            finalized.append((heading, fallback_content))
             continue
-        words = context.replace("\n", " ").split()
-        if words:
-            fragments.append((heading, " ".join(words[:280])))
-    if not fragments:
-        return sections
-
-    enriched = list(sections)
-    used_fragments: set[int] = set()
-    while current_words < target_words and len(used_fragments) < len(fragments):
-        for index, (heading, content) in enumerate(enriched):
-            if current_words >= target_words:
-                break
-            fragment_index = next(
-                (candidate for candidate, (fragment_heading, _) in enumerate(fragments)
-                 if candidate not in used_fragments and fragment_heading.lower() == heading.lower()),
-                None,
-            )
-            if fragment_index is None:
-                fragment_index = next(
-                    (candidate for candidate in range(len(fragments)) if candidate not in used_fragments),
-                    None,
-                )
-            if fragment_index is None:
-                continue
-            used_fragments.add(fragment_index)
-            _, fragment = fragments[fragment_index]
-            remaining = target_words - current_words
-            addition_words = fragment.split()[:min(280, remaining)]
-            if not addition_words:
-                continue
-            addition = "Evidence detail from the indexed repository: " + " ".join(addition_words)
-            enriched[index] = (heading, f"{content}\n\n{addition}")
-            current_words += len(addition.split())
-    return enriched
+        finalized.append((heading, _clean_model_section(content, fallback_content)))
+    return finalized
 
 
 async def _template_sections(db: AsyncSession, project_id: UUID, template: dict, analysis: AnalysisResult) -> list[tuple[str, str]]:
@@ -283,7 +295,7 @@ Target layout: {template['layout']['columns']} column(s).
 Target length: exactly {template['layout']['page_target']} in the exported document and approximately {template['layout']['target_words']} words of actual content. Write enough connected prose to reach that target; do not pad with blank lines or repeat the same point. Do not leave any section as a one-sentence placeholder: expand each technical section with repository-grounded explanation, implementation details, relationships, limitations, and evidence. For the standard report, aim for at least 350 words in each major technical section. For the IEEE report, aim for at least 150 words in each section while remaining concise.
 Writing style: {template['layout']['depth']}. Make the sections flow as one paper, with useful paragraphs rather than one-line summaries.
 
-Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. For every technical section, explain the relevant evidence in detail and cite the supplied FILE and line range in prose where useful. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, explicitly explain when external evidence is unavailable while still providing relevant repository-grounded discussion. The user may paste material from the separate Research/Literature Review feature into those four sections after generation; leave those sections clearly editable and do not fabricate external literature.
+Use only the supplied repository analysis and evidence. Do not invent metrics, citations, technologies, features, external papers, authors, or experimental results. Repository evidence is grounding input only: never copy FILE blocks, file paths with source excerpts, Python, JavaScript, JSX, HTML, configuration, JSON, or fenced code into the report. Synthesize the evidence into relevant explanatory prose; do not quote or concatenate retrieved chunks. Do not use evidence from one heading to fill another heading. Do not cite raw FILE/line ranges in the final prose unless the sentence also explains why that file is relevant to the current heading. For Literature Review, Research Gap & Motivation, Comparison with Existing System, and References, use the exact user-input placeholder when external evidence is unavailable; do not fill those sections with unrelated repository code. The user may paste material from the separate Research/Literature Review feature into those four sections after generation.
 
 COMPLETE PROJECT ANALYSIS:
 {analysis_json}
@@ -310,14 +322,10 @@ HEADING-RELATED REPOSITORY EVIDENCE:
         for heading in headings
     ]
 
-    # The first pass already receives the complete analysis and all retrieved
-    # evidence. A second full-document LLM call doubled generation time and
-    # frequently hit the provider timeout, without adding new evidence.
-    sections = _expand_sections_with_evidence(
-        first_pass_sections,
-        retrieved,
-        int(template["layout"]["target_words"]),
-    )
+    # Retrieved excerpts are grounding material for the model only. They must
+    # never be appended directly to a report: doing that created unrelated
+    # source-code dumps and allowed one heading's evidence to leak into another.
+    sections = _finalize_report_sections(first_pass_sections, fallback)
     return EditableDocument(title="USER INPUT REQUIRED — Enter paper title", document_type=document_type,
                             authors=[{"name": "USER INPUT REQUIRED — Enter author name", "institution": ""}],
                             date="",
